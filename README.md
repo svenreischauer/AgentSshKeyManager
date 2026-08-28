@@ -1,10 +1,18 @@
 # Agent SSH Key Manager
 
+[![Platform: Windows](https://img.shields.io/badge/Platform-Windows-blue)](https://github.com/svenreischauer/AgentSshKeyManager)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/svenreischauer/AgentSshKeyManager)](https://github.com/svenreischauer/AgentSshKeyManager/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/svenreischauer/AgentSshKeyManager?style=social)](https://github.com/svenreischauer/AgentSshKeyManager/stargazers)
+
 Agent SSH Manager is a portable Windows tool for creating, installing, and removing temporary SSH keys for AI agents (e.g., Claude Code) on Ubuntu servers.
 Administer remote servers by AI agents is convenient however, you want to do it without sharing your ssh credentials. With Agent SSH Manager, you can generate temporary SSH keys for your agent, granting them sudo access to the server without exposing your personal credentials.
 
+Download the latest [`AgentSshKeyManager.exe`](https://github.com/svenreischauer/AgentSshKeyManager/releases/latest/download/AgentSshKeyManager.exe) from the Releases page. It requires no installer and uses the Windows OpenSSH client.
 
-The finished application is `AgentSshKeyManager.exe`. It requires no installer and uses the Windows OpenSSH client.
+## Screenshot
+
+![Agent SSH Key Manager graphical interface](docs/gui.jpg)
 
 ## What it does
 

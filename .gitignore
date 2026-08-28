@@ -10,6 +10,7 @@ ssh-action-*.result
 # Build intermediates
 bin/
 obj/
+/AgentSshKeyManager.exe
 *.pdb
 *.tmp
 
