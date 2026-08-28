@@ -1,0 +1,21 @@
+# Local SSH material and generated session data
+Sessions/
+id_ed25519
+id_ed25519.pub
+known_hosts
+ssh_config
+ssh-action-*.ps1
+ssh-action-*.result
+
+# Build intermediates
+bin/
+obj/
+*.pdb
+*.tmp
+
+# Editor and operating-system files
+.vs/
+.vscode/
+*.user
+Thumbs.db
+Desktop.ini
