@@ -1,5 +1,6 @@
 param(
     [switch]$UnsignedDevelopmentBuild,
+    [switch]$UnsignedRelease,
     [string]$ReleaseVersion,
     [string]$CertificateThumbprint,
     [string]$SignToolPath,
@@ -13,6 +14,7 @@ $distDir = Join-Path $projectDir 'dist'
 $source = Join-Path $projectDir 'Program.cs'
 $manifest = Join-Path $projectDir 'app.manifest'
 $officialOutputName = 'AgentSshKeyManager.exe'
+$unsignedReleaseOutputName = 'AgentSshKeyManager-UNSIGNED.exe'
 $developmentOutputName = 'AgentSshKeyManager-UNSIGNED-DEVELOPMENT.exe'
 
 function Resolve-SignTool {
@@ -129,18 +131,31 @@ function Invoke-StagedSelfTest {
     }
 }
 
-$releaseArgumentNames = @('ReleaseVersion', 'CertificateThumbprint', 'SignToolPath', 'TimestampUrl')
-$suppliedReleaseArguments = @($releaseArgumentNames | Where-Object { $PSBoundParameters.ContainsKey($_) })
+$signingArgumentNames = @('CertificateThumbprint', 'SignToolPath', 'TimestampUrl')
+$suppliedSigningArguments = @($signingArgumentNames | Where-Object { $PSBoundParameters.ContainsKey($_) })
 
 if ($UnsignedDevelopmentBuild) {
-    if ($suppliedReleaseArguments.Count -gt 0) {
-        throw "-UnsignedDevelopmentBuild cannot be combined with release options: $($suppliedReleaseArguments -join ', ')."
+    $conflictingArguments = @()
+    if ($UnsignedRelease) { $conflictingArguments += 'UnsignedRelease' }
+    if ($PSBoundParameters.ContainsKey('ReleaseVersion')) { $conflictingArguments += 'ReleaseVersion' }
+    $conflictingArguments += $suppliedSigningArguments
+    if ($conflictingArguments.Count -gt 0) {
+        throw "-UnsignedDevelopmentBuild cannot be combined with release options: $($conflictingArguments -join ', ')."
     }
-    $isRelease = $false
+    $buildMode = 'UnsignedDevelopment'
+}
+elseif ($UnsignedRelease) {
+    if ($suppliedSigningArguments.Count -gt 0) {
+        throw "-UnsignedRelease cannot be combined with signing options: $($suppliedSigningArguments -join ', ')."
+    }
+    if ([string]::IsNullOrWhiteSpace($ReleaseVersion)) {
+        throw 'Unsigned release mode requires -ReleaseVersion.'
+    }
+    $buildMode = 'UnsignedRelease'
 }
 else {
     if (-not $PSBoundParameters.ContainsKey('ReleaseVersion') -and -not $PSBoundParameters.ContainsKey('CertificateThumbprint')) {
-        throw 'Choose an explicit mode: use -UnsignedDevelopmentBuild, or provide both -ReleaseVersion and -CertificateThumbprint for a signed release.'
+        throw 'Choose an explicit mode: use -UnsignedDevelopmentBuild; use -UnsignedRelease with -ReleaseVersion; or provide -ReleaseVersion and -CertificateThumbprint for a signed release.'
     }
     if ([string]::IsNullOrWhiteSpace($ReleaseVersion)) {
         throw 'Signed release mode requires -ReleaseVersion.'
@@ -148,8 +163,12 @@ else {
     if ([string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
         throw 'Signed release mode requires -CertificateThumbprint.'
     }
-    $isRelease = $true
+    $buildMode = 'SignedRelease'
 }
+
+$isSignedRelease = $buildMode -eq 'SignedRelease'
+$isUnsignedReleaseMode = $buildMode -eq 'UnsignedRelease'
+$isVersionedRelease = $isSignedRelease -or $isUnsignedReleaseMode
 
 $compilerCandidates = @(
     "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
@@ -173,7 +192,7 @@ if (Test-Path -LiteralPath $distDir) {
     }
 }
 
-if ($isRelease) {
+if ($isVersionedRelease) {
     $normalizedVersion = $ReleaseVersion.Trim()
     if ($normalizedVersion.StartsWith('v', [System.StringComparison]::OrdinalIgnoreCase)) {
         $normalizedVersion = $normalizedVersion.Substring(1)
@@ -192,25 +211,34 @@ if ($isRelease) {
         }
     }
     $assemblyVersion = "$versionCore.0"
-    $informationalVersion = $normalizedVersion
-    $assemblyConfiguration = 'Release'
-    $assemblyDescription = 'Manages temporary SSH access for authorized server administration.'
-
-    $normalizedThumbprint = ($CertificateThumbprint -replace '[\s\p{Cf}]', '').ToUpperInvariant()
-    if ($normalizedThumbprint -notmatch '^[0-9A-F]{40}$') {
-        throw 'CertificateThumbprint must be the 40-character hexadecimal SHA-1 thumbprint used by SignTool /sha1.'
-    }
-
-    $TimestampUrl = $TimestampUrl.Trim()
-    $timestampUri = $null
-    if (-not [Uri]::TryCreate($TimestampUrl, [UriKind]::Absolute, [ref]$timestampUri) -or
-        ($timestampUri.Scheme -ne 'http' -and $timestampUri.Scheme -ne 'https')) {
-        throw 'TimestampUrl must be an absolute HTTP or HTTPS URL for an RFC 3161 timestamp service.'
-    }
-
-    $resolvedSignTool = Resolve-SignTool -RequestedPath $SignToolPath
-    $outputName = $officialOutputName
     $finalDir = Join-Path $distDir ('v' + $normalizedVersion)
+
+    if ($isSignedRelease) {
+        $informationalVersion = $normalizedVersion
+        $assemblyConfiguration = 'Release'
+        $assemblyDescription = 'Manages temporary SSH access for authorized server administration.'
+
+        $normalizedThumbprint = ($CertificateThumbprint -replace '[\s\p{Cf}]', '').ToUpperInvariant()
+        if ($normalizedThumbprint -notmatch '^[0-9A-F]{40}$') {
+            throw 'CertificateThumbprint must be the 40-character hexadecimal SHA-1 thumbprint used by SignTool /sha1.'
+        }
+
+        $TimestampUrl = $TimestampUrl.Trim()
+        $timestampUri = $null
+        if (-not [Uri]::TryCreate($TimestampUrl, [UriKind]::Absolute, [ref]$timestampUri) -or
+            ($timestampUri.Scheme -ne 'http' -and $timestampUri.Scheme -ne 'https')) {
+            throw 'TimestampUrl must be an absolute HTTP or HTTPS URL for an RFC 3161 timestamp service.'
+        }
+
+        $resolvedSignTool = Resolve-SignTool -RequestedPath $SignToolPath
+        $outputName = $officialOutputName
+    }
+    else {
+        $informationalVersion = $normalizedVersion + '-unsigned'
+        $assemblyConfiguration = 'UnsignedRelease'
+        $assemblyDescription = 'UNSIGNED RELEASE of Agent SSH Key Manager; no Authenticode publisher signature.'
+        $outputName = $unsignedReleaseOutputName
+    }
 }
 else {
     $outputName = $developmentOutputName
@@ -306,7 +334,7 @@ using System.Reflection;
     Remove-Item -LiteralPath $generatedAssemblyInfo -Force
     Remove-Item -LiteralPath $generatedManifest -Force
 
-    if ($isRelease) {
+    if ($isSignedRelease) {
         & $resolvedSignTool sign /sha1 $normalizedThumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $stagedOutput
         $signExitCode = $LASTEXITCODE
         if ($signExitCode -ne 0) {
@@ -351,8 +379,12 @@ finally {
 
 $finalOutput = Join-Path $finalDir $outputName
 $finalChecksum = $finalOutput + '.sha256'
-if ($isRelease) {
+if ($isSignedRelease) {
     Write-Host "Created signed release: $finalOutput"
+}
+elseif ($isUnsignedReleaseMode) {
+    Write-Warning 'Created an UNSIGNED RELEASE. It has no Authenticode publisher identity or signature and may be treated as untrusted.'
+    Write-Host "Created unsigned release: $finalOutput"
 }
 else {
     Write-Warning 'Created an UNSIGNED DEVELOPMENT build. Do not publish it as an official release.'

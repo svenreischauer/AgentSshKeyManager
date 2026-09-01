@@ -8,7 +8,7 @@
 Agent SSH Manager is a portable Windows tool for creating, installing, and removing temporary SSH keys for AI agents (e.g., Claude Code) on Ubuntu servers.
 Administer remote servers by AI agents is convenient however, you want to do it without sharing your ssh credentials. With Agent SSH Manager, you can generate temporary SSH keys for your agent, granting them sudo access to the server without exposing your personal credentials.
 
-Download the latest [`AgentSshKeyManager.exe`](https://github.com/svenreischauer/AgentSshKeyManager/releases/latest/download/AgentSshKeyManager.exe) from the Releases page. It requires no installer and uses the Windows OpenSSH client.
+Download the latest [`AgentSshKeyManager-UNSIGNED.exe`](https://github.com/svenreischauer/AgentSshKeyManager/releases/latest/download/AgentSshKeyManager-UNSIGNED.exe) from the Releases page. It requires no installer and uses the Windows OpenSSH client. The filename is intentional: this release has no Authenticode publisher signature and may be treated as untrusted by Windows or security software.
 
 ## Screenshot
 
@@ -86,13 +86,23 @@ Each session also has an `interactive-actions.log` audit file containing timesta
 
 ## Build, signing, and self-test
 
-The build has two explicit modes. For local development, create a clearly marked unsigned executable:
+The build has three explicit modes. For local development, create a clearly marked unsigned executable:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1 -UnsignedDevelopmentBuild
 ```
 
 Each development build gets a fresh `dist\dev-unsigned-*` directory and the filename `AgentSshKeyManager-UNSIGNED-DEVELOPMENT.exe`. The build runs the executable's local self-test and writes a matching `.sha256` file. Never publish this artifact as an official release.
+
+To deliberately create a versioned release before a code-signing certificate is available, use the explicit unsigned-release mode:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1 `
+    -ReleaseVersion 1.0.1 `
+    -UnsignedRelease
+```
+
+This creates `dist\v1.0.1\AgentSshKeyManager-UNSIGNED.exe` and its checksum with version `1.0.1.0` and visibly unsigned metadata. It uses the same staged self-test, checksum, and transactional directory publication as the other modes, but it has no publisher identity or signature. Do not rename it to `AgentSshKeyManager.exe`; that official basename is reserved for successfully signed builds.
 
 For a signed production release, supply a semantic version and the thumbprint of an Authenticode code-signing certificate exposed in the current user's certificate store:
 
@@ -104,7 +114,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1 `
 
 If `signtool.exe` is not on `PATH`, add `-SignToolPath 'C:\Program Files (x86)\Windows Kits\10\bin\<SDK-version>\x64\signtool.exe'`.
 
-A successful release build creates exactly these publishable files in a new versioned directory:
+A successful signed release build creates exactly these publishable files in a new versioned directory:
 
 ```text
 dist\v1.1.0\AgentSshKeyManager.exe
