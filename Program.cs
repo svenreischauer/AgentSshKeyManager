@@ -8,6 +8,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -99,6 +100,18 @@ namespace AgentSshKeyManager
         [STAThread]
         private static int Main(string[] args)
         {
+            if (args != null && args.Length == 1 && args[0] == "--self-test-child-exit-probe")
+            {
+                return 37;
+            }
+
+            if (args != null && args.Length == 2 &&
+                (args[0] == "--interactive-install" || args[0] == "--interactive-remove"))
+            {
+                string action = args[0] == "--interactive-install" ? "install" : "remove";
+                return InteractiveConsoleHost.Run(action, args[1]);
+            }
+
             if (args != null && args.Length >= 2 && args[0] == "--self-test")
             {
                 return SelfTest.Run(args[1]);
@@ -127,6 +140,247 @@ namespace AgentSshKeyManager
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
             return 0;
+        }
+    }
+
+    internal static class InteractiveConsoleLauncher
+    {
+        public static int Run(SessionRecord record, string action)
+        {
+            ProcessStartInfo info = CreateStartInfo(record, action);
+            return WaitForExit(info);
+        }
+
+        internal static ProcessStartInfo CreateStartInfo(SessionRecord record, string action)
+        {
+            if (record == null || !Regex.IsMatch(record.Id ?? "", "^[a-fA-F0-9]{32}$"))
+            {
+                throw new InvalidOperationException("The access session identifier is invalid.");
+            }
+            if (action != "install" && action != "remove")
+            {
+                throw new InvalidOperationException("The interactive SSH action is invalid.");
+            }
+
+            var info = new ProcessStartInfo();
+            info.FileName = Application.ExecutablePath;
+            info.Arguments = (action == "install" ? "--interactive-install " : "--interactive-remove ") + record.Id;
+            info.UseShellExecute = false;
+            info.CreateNoWindow = true;
+            return info;
+        }
+
+        internal static int WaitForExit(ProcessStartInfo info)
+        {
+            using (var process = Process.Start(info))
+            {
+                process.WaitForExit();
+                return process.ExitCode;
+            }
+        }
+    }
+
+    internal static class InteractiveConsoleHost
+    {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AllocConsole();
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool SetConsoleTitle(string title);
+
+        public static int Run(string action, string sessionId)
+        {
+            bool consoleReady = AllocConsole();
+            if (consoleReady)
+            {
+                Console.SetOut(new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true });
+                Console.SetError(new StreamWriter(Console.OpenStandardError(), new UTF8Encoding(false)) { AutoFlush = true });
+                Console.SetIn(new StreamReader(Console.OpenStandardInput(), Encoding.UTF8));
+                SetConsoleTitle("Agent SSH Key Manager");
+            }
+
+            SessionRecord record = null;
+            string auditPath = null;
+            bool auditWarning = false;
+            try
+            {
+                if ((action != "install" && action != "remove") || !Regex.IsMatch(sessionId ?? "", "^[a-fA-F0-9]{32}$"))
+                {
+                    throw new InvalidOperationException("The interactive SSH request is invalid.");
+                }
+
+                record = SessionStore.LoadById(sessionId);
+                if (record == null)
+                {
+                    throw new InvalidOperationException("The requested access session was not found.");
+                }
+                if (!SessionStore.IsActionAllowed(record, action))
+                {
+                    throw new InvalidOperationException("The requested SSH action is not valid for this session state.");
+                }
+                auditPath = InteractiveAudit.PathFor(record);
+
+                List<string> sshArguments = SshTools.BuildInteractiveArguments(record, action);
+                string remotePayload = sshArguments[sshArguments.Count - 1];
+                string startupDetails = InteractiveAudit.BuildStartupDetails(remotePayload);
+                auditWarning = !InteractiveAudit.TryAppend(record, action, "console_started", null, startupDetails);
+
+                WriteHeader(record, action);
+                var info = SshTools.CreateInteractiveSshStartInfo(sshArguments);
+                using (var process = Process.Start(info))
+                {
+                    if (!InteractiveAudit.TryAppend(record, action, "ssh_started", process.Id, null)) auditWarning = true;
+                    process.WaitForExit();
+                    int exitCode = process.ExitCode;
+                    if (!InteractiveAudit.TryAppend(record, action, "ssh_exited", process.Id,
+                        "exit_code=" + exitCode.ToString(CultureInfo.InvariantCulture))) auditWarning = true;
+
+                    Console.WriteLine();
+                    if (exitCode == 0)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine("SSH operation completed successfully.");
+                    }
+                    else
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine("SSH operation failed with exit code " + exitCode.ToString(CultureInfo.InvariantCulture) + ".");
+                        Console.WriteLine("Review the SSH output above for the detailed error.");
+                    }
+                    Console.ResetColor();
+                    WriteAuditStatus(auditPath, auditWarning);
+                    Pause();
+                    return exitCode;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (record != null)
+                {
+                    if (!InteractiveAudit.TryAppend(record, action, "host_error", null,
+                        ex.GetType().Name + ": " + InteractiveAudit.SafeField(ex.Message))) auditWarning = true;
+                }
+                if (consoleReady)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine();
+                    Console.WriteLine("The SSH operation could not be started.");
+                    Console.WriteLine(ex.Message);
+                    Console.ResetColor();
+                    WriteAuditStatus(auditPath, auditWarning);
+                    Pause();
+                }
+                return 1;
+            }
+        }
+
+        private static void WriteHeader(SessionRecord record, string action)
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine();
+            Console.WriteLine(action == "install" ? "INSTALL TEMPORARY SSH ACCESS" : "REMOVE TEMPORARY SSH ACCESS");
+            Console.ResetColor();
+            Console.WriteLine("Server: " + record.Host + ":" + record.Port.ToString(CultureInfo.InvariantCulture));
+            Console.WriteLine(action == "install"
+                ? "Verify the server fingerprint, then enter SSH and sudo passwords when requested. Passwords are handled only by ssh.exe and the remote sudo command."
+                : "Enter SSH and sudo passwords when requested. The temporary access will be removed from the server.");
+            Console.WriteLine();
+        }
+
+        private static void Pause()
+        {
+            Console.WriteLine();
+            Console.Write("Press ENTER to close this window ... ");
+            Console.ReadLine();
+        }
+
+        private static void WriteAuditStatus(string auditPath, bool warning)
+        {
+            if (warning)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("Warning: the local audit log could not be updated.");
+                Console.ResetColor();
+            }
+            else if (!string.IsNullOrWhiteSpace(auditPath))
+            {
+                Console.WriteLine("Audit log: " + auditPath);
+            }
+        }
+    }
+
+    internal static class InteractiveAudit
+    {
+        public static string PathFor(SessionRecord record)
+        {
+            return System.IO.Path.Combine(record.SessionDirectory, "interactive-actions.log");
+        }
+
+        public static bool TryAppend(SessionRecord record, string action, string stage, int? childPid, string details)
+        {
+            try
+            {
+                string path = PathFor(record);
+                string line = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture) +
+                    " action=" + SafeField(action) +
+                    " session=" + SafeField(record.Id) +
+                    " stage=" + SafeField(stage) +
+                    (childPid.HasValue ? " child_pid=" + childPid.Value.ToString(CultureInfo.InvariantCulture) : "") +
+                    (string.IsNullOrWhiteSpace(details) ? "" : " " + SafeField(details)) + Environment.NewLine;
+                File.AppendAllText(path, line, new UTF8Encoding(false));
+                SessionStore.TrySecurePrivateFile(path);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static string BuildStartupDetails(string remotePayload)
+        {
+            var fields = new List<string>();
+            try { fields.Add("app_sha256=" + HashFile(Application.ExecutablePath)); }
+            catch { fields.Add("app_sha256=unavailable"); }
+            fields.Add("ssh_path=" + SafeField(SshTools.SshExecutablePath));
+            try { fields.Add("ssh_version=" + SafeField(SshTools.GetSshVersion())); }
+            catch { fields.Add("ssh_version=unavailable"); }
+            fields.Add("payload_sha256=" + HashText(remotePayload));
+            fields.Add("payload_length=" + (remotePayload ?? "").Length.ToString(CultureInfo.InvariantCulture));
+            return string.Join("; ", fields.ToArray());
+        }
+
+        public static string SafeField(string value)
+        {
+            string safe = Regex.Replace(value ?? "", "[\r\n\t]+", " ").Trim();
+            return safe.Length <= 512 ? safe : safe.Substring(0, 512);
+        }
+
+        public static string HashText(string value)
+        {
+            return HashBytes(new UTF8Encoding(false).GetBytes(value ?? ""));
+        }
+
+        public static string HashFile(string path)
+        {
+            using (var stream = File.OpenRead(path))
+            using (var algorithm = SHA256.Create())
+            {
+                return ToHex(algorithm.ComputeHash(stream));
+            }
+        }
+
+        private static string HashBytes(byte[] value)
+        {
+            using (var algorithm = SHA256.Create())
+            {
+                return ToHex(algorithm.ComputeHash(value));
+            }
+        }
+
+        private static string ToHex(byte[] value)
+        {
+            return string.Concat(value.Select(b => b.ToString("x2", CultureInfo.InvariantCulture)).ToArray());
         }
     }
 
@@ -442,7 +696,7 @@ namespace AgentSshKeyManager
                 MessageBox.Show(this, "Enter a valid IP address or server hostname.", "Check input", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return false;
             }
-            if (user.Length == 0 || user.Length > 64 || !Regex.IsMatch(user, "^[A-Za-z0-9._-]+$"))
+            if (user.Length == 0 || user.Length > 64 || !Regex.IsMatch(user, "^[A-Za-z0-9_][A-Za-z0-9._-]*$"))
             {
                 MessageBox.Show(this, "Enter a valid Linux username.", "Check input", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return false;
@@ -462,6 +716,7 @@ namespace AgentSshKeyManager
                 "A new temporary key will be generated, then a separate SSH window will open.\n\n" +
                 "1. On first contact, compare the displayed server fingerprint with a trusted fingerprint for the server.\n" +
                 "2. Enter the SSH password and, if requested, the sudo password only in that separate window.\n" +
+                "   The window remains open after SSH finishes; press ENTER after reviewing the result.\n" +
                 (_dedicatedAdminCheck.Checked
                     ? "3. The tool creates a dedicated temporary account with full passwordless sudo access. These privileges apply only to that maintenance account.\n\n"
                     : "3. The key is installed for the existing user; that user's sudo configuration remains unchanged.\n\n") +
@@ -520,7 +775,8 @@ namespace AgentSshKeyManager
                     record.LastMessage = (installExit == -1073741510
                         ? "The SSH window was interrupted before completion. "
                         : "SSH setup failed (exit code " + installExit + "). ") +
-                        "The new key could not be verified. " + SafeOneLine(verification.Combined);
+                        "The new key could not be verified. " + SafeOneLine(verification.Combined) +
+                        " Audit log, if available: " + InteractiveAudit.PathFor(record);
                     SessionStore.Save(record);
                     RefreshList(record);
                     Log(record.LastMessage);
@@ -528,7 +784,9 @@ namespace AgentSshKeyManager
                         ? "\n\nIf the server uses an incompatible OpenSSH configuration, create a new access without the server-side expiry option."
                         : "";
                     MessageBox.Show(this,
-                        "Login with the temporary key failed. Clean up this entry with 'Remove access', then create a new one. Close the SSH window only when it explicitly asks you to press ENTER." + expiryHint,
+                        "Login with the temporary key failed. Clean up this entry with 'Remove access', then create a new one. " +
+                        "The separate SSH window showed the detailed setup output before it closed.\n\n" +
+                        "Audit log, if available (timestamps and exit codes):\n" + InteractiveAudit.PathFor(record) + expiryHint,
                         "Key test failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
@@ -684,11 +942,14 @@ namespace AgentSshKeyManager
                     if (fallbackExit != 0)
                     {
                         record.State = "RemovalFailed";
-                        record.LastMessage = "Removal through password login failed or was cancelled.";
+                        record.LastMessage = "Removal through password login failed or was cancelled. Audit log, if available: " + InteractiveAudit.PathFor(record);
                         SessionStore.Save(record);
                         RefreshList(record);
                         Log(record.LastMessage);
-                        MessageBox.Show(this, "The server entry was not removed safely. The local key is retained so you can try again.", "Removal not confirmed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        MessageBox.Show(this, "The server entry was not removed safely. The local key is retained so you can try again. " +
+                            "The separate SSH window showed the detailed error before it closed.\n\n" +
+                            "Audit log, if available (timestamps and exit codes):\n" + InteractiveAudit.PathFor(record),
+                            "Removal not confirmed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                         return;
                     }
                 }
@@ -836,7 +1097,6 @@ namespace AgentSshKeyManager
             try
             {
                 Directory.CreateDirectory(SessionsRoot);
-                var serializer = new XmlSerializer(typeof(SessionRecord));
                 string[] roots = new[] { SessionsRoot, LegacySessionsRoot }
                     .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
                 foreach (string root in roots)
@@ -845,20 +1105,10 @@ namespace AgentSshKeyManager
                     bool legacy = string.Equals(root, LegacySessionsRoot, StringComparison.OrdinalIgnoreCase);
                     foreach (string file in Directory.GetFiles(root, "session.xml", SearchOption.AllDirectories))
                     {
-                        try
-                        {
-                            using (var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read))
-                            {
-                                var record = serializer.Deserialize(stream) as SessionRecord;
-                                // Removed records from older versions are not useful in the new list.
-                                // Unfinished records remain visible so their server access can be removed safely.
-                                if (record != null && !(legacy && record.State == "Removed")) result.Add(record);
-                            }
-                        }
-                        catch
-                        {
-                            // One damaged metadata file must not block the remaining sessions.
-                        }
+                        SessionRecord record = LoadStoredRecord(file);
+                        // Removed records from older versions are not useful in the new list.
+                        // Unfinished records remain visible so their server access can be removed safely.
+                        if (record != null && !(legacy && record.State == "Removed")) result.Add(record);
                     }
                 }
             }
@@ -869,14 +1119,116 @@ namespace AgentSshKeyManager
             return result;
         }
 
+        public static SessionRecord LoadById(string id)
+        {
+            if (!Regex.IsMatch(id ?? "", "^[a-fA-F0-9]{32}$")) return null;
+            return LoadAll().FirstOrDefault(record =>
+                record != null && string.Equals(record.Id, id, StringComparison.OrdinalIgnoreCase));
+        }
+
+        internal static SessionRecord LoadStoredRecord(string file)
+        {
+            try
+            {
+                var serializer = new XmlSerializer(typeof(SessionRecord));
+                using (var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    var record = serializer.Deserialize(stream) as SessionRecord;
+                    NormalizeLoadedRecord(record, Path.GetDirectoryName(file));
+                    return IsValidStoredRecord(record) ? record : null;
+                }
+            }
+            catch
+            {
+                // One damaged or untrusted metadata file must not block other sessions.
+                return null;
+            }
+        }
+
+        private static void NormalizeLoadedRecord(SessionRecord record, string directory)
+        {
+            if (record == null || string.IsNullOrWhiteSpace(directory)) return;
+            record.SessionDirectory = Path.GetFullPath(directory);
+            record.PrivateKeyPath = Path.Combine(record.SessionDirectory, "id_ed25519");
+            record.PublicKeyPath = record.PrivateKeyPath + ".pub";
+            record.KnownHostsPath = Path.Combine(record.SessionDirectory, "known_hosts");
+            record.ConfigPath = Path.Combine(record.SessionDirectory, "ssh_config");
+            if (string.IsNullOrWhiteSpace(record.BootstrapUser) && !record.UsesDedicatedAdminAccount)
+            {
+                record.BootstrapUser = record.User;
+            }
+        }
+
+        private static bool IsValidStoredRecord(SessionRecord record)
+        {
+            if (record == null || !Regex.IsMatch(record.Id ?? "", "^[a-f0-9]{32}$")) return false;
+            if (string.IsNullOrWhiteSpace(record.Host) || record.Host.Length > 253 ||
+                !Regex.IsMatch(record.Host, "^[A-Za-z0-9._:-]+$") || !Regex.IsMatch(record.Host, "[A-Za-z0-9]")) return false;
+            if (!IsSafeLogin(record.User) || !IsSafeLogin(record.BootstrapUser)) return false;
+            if (record.Port < 1 || record.Port > 65535) return false;
+            if (string.IsNullOrWhiteSpace(record.SessionDirectory) ||
+                !string.Equals(Path.GetFileName(record.SessionDirectory), record.Id, StringComparison.Ordinal)) return false;
+
+            string marker = record.Marker ?? "";
+            bool currentMarker = marker == "agent-ssh-access:" + record.Id;
+            bool legacyMarker = marker == "codex-access:" + record.Id;
+            if (!currentMarker && !legacyMarker) return false;
+
+            string shortId = record.Id.Substring(0, 10);
+            string currentAlias = "agent-ssh-" + shortId;
+            string legacyAlias = "codex-ssh-" + shortId;
+            if (record.Alias != currentAlias && !(legacyMarker && record.Alias == legacyAlias)) return false;
+
+            if (record.AccessMode == "DedicatedAdmin")
+            {
+                if (record.User != "agentssh_" + shortId) return false;
+            }
+            else if (record.AccessMode == "ExistingUser")
+            {
+                if (!string.Equals(record.User, record.BootstrapUser, StringComparison.Ordinal)) return false;
+            }
+            else
+            {
+                return false;
+            }
+
+            if (record.State != "Preparing" && record.State != "SetupFailed" && record.State != "Active" &&
+                record.State != "RemovalFailed" && record.State != "Removed") return false;
+            return true;
+        }
+
+        internal static bool IsActionAllowed(SessionRecord record, string action)
+        {
+            if (record == null) return false;
+            if (action == "install") return record.State == "Preparing";
+            if (action == "remove")
+            {
+                return record.State == "Preparing" || record.State == "SetupFailed" ||
+                    record.State == "Active" || record.State == "RemovalFailed";
+            }
+            return false;
+        }
+
+        private static bool IsSafeLogin(string value)
+        {
+            return !string.IsNullOrWhiteSpace(value) && value.Length <= 64 &&
+                Regex.IsMatch(value, "^[A-Za-z0-9_][A-Za-z0-9._-]*$");
+        }
+
         public static void DeleteSecretMaterial(SessionRecord record)
         {
             DeleteIfPresent(record.PrivateKeyPath);
             DeleteIfPresent(record.PublicKeyPath);
             DeleteIfPresent(record.ConfigPath);
-            foreach (string helper in Directory.GetFiles(record.SessionDirectory, "ssh-action-*.ps1", SearchOption.TopDirectoryOnly))
+            if (!string.IsNullOrWhiteSpace(record.SessionDirectory) && Directory.Exists(record.SessionDirectory))
             {
-                DeleteIfPresent(helper);
+                foreach (string pattern in new[] { "ssh-action-*." + "ps1", "ssh-action-*." + "result" })
+                {
+                    foreach (string helper in Directory.GetFiles(record.SessionDirectory, pattern, SearchOption.TopDirectoryOnly))
+                    {
+                        DeleteIfPresent(helper);
+                    }
+                }
             }
         }
 
@@ -927,9 +1279,13 @@ namespace AgentSshKeyManager
 
     public static class SshTools
     {
-        private static readonly string SshPath = FindTool("ssh.exe");
-        private static readonly string SshKeygenPath = FindTool("ssh-keygen.exe");
-        private static readonly string PowerShellPath = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+        private static readonly string SshPath = FindWindowsOpenSshTool("ssh.exe");
+        private static readonly string SshKeygenPath = FindWindowsOpenSshTool("ssh-keygen.exe");
+
+        internal static string SshExecutablePath
+        {
+            get { return SshPath; }
+        }
 
         public static void GenerateKeyAndFiles(SessionRecord record, bool serverExpiry)
         {
@@ -975,44 +1331,80 @@ namespace AgentSshKeyManager
 
         public static int RunInteractiveInstall(SessionRecord record)
         {
-            string publicKey = File.ReadAllText(record.PublicKeyPath).Trim();
-            if (!publicKey.StartsWith("ssh-ed25519 ", StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException("The generated public-key format is unexpected.");
-            }
-            bool useExpiry = record.EnforceServerExpiry ||
-                (record.LastMessage ?? "").IndexOf("with server-side expiry", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                (record.LastMessage ?? "").IndexOf("mit serverseitigem", StringComparison.OrdinalIgnoreCase) >= 0;
-            string options = "no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc";
-            string authorizedLine = options + " " + publicKey;
-            long expiryUnixSeconds = UnixSeconds(record.ExpiresUtcValue);
-            string remote = record.UsesDedicatedAdminAccount
-                ? BuildDedicatedSetupCommand(record, authorizedLine, useExpiry, expiryUnixSeconds)
-                : BuildInstallCommand(record.Marker, authorizedLine, useExpiry, expiryUnixSeconds);
-
-            var args = BaseInteractiveArguments(record);
-            args.Add((record.UsesDedicatedAdminAccount ? record.BootstrapUser : record.User) + "@" + record.Host);
-            args.Add(EncodeRemoteCommand(remote));
-            return RunVisiblePowerShell(record, "install", args,
-                "INSTALL TEMPORARY SSH ACCESS",
-                record.UsesDedicatedAdminAccount
-                    ? "Verify the server fingerprint first. Then enter the SSH and sudo passwords. They are not stored."
-                    : "Verify the server fingerprint first. Then enter the SSH password. It is not stored.");
+            return InteractiveConsoleLauncher.Run(record, "install");
         }
 
         public static int RunInteractiveRemoval(SessionRecord record)
         {
-            string remote = record.UsesDedicatedAdminAccount
-                ? BuildDedicatedCleanupCommand(record)
-                : BuildRemovalCommand(record.Marker, record.Id);
+            return InteractiveConsoleLauncher.Run(record, "remove");
+        }
+
+        internal static List<string> BuildInteractiveArguments(SessionRecord record, string action)
+        {
+            if (record == null) throw new ArgumentNullException("record");
+            if (action != "install" && action != "remove")
+            {
+                throw new ArgumentException("The interactive SSH action is invalid.", "action");
+            }
+
+            string remote;
+            string loginUser;
+            if (action == "install")
+            {
+                string publicKey = ReadValidatedPublicKey(record);
+                bool useExpiry = record.EnforceServerExpiry ||
+                    (record.LastMessage ?? "").IndexOf("with server-side expiry", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    (record.LastMessage ?? "").IndexOf("mit serverseitigem", StringComparison.OrdinalIgnoreCase) >= 0;
+                string options = "no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc";
+                string authorizedLine = options + " " + publicKey;
+                long expiryUnixSeconds = UnixSeconds(record.ExpiresUtcValue);
+                remote = record.UsesDedicatedAdminAccount
+                    ? BuildDedicatedSetupCommand(record, authorizedLine, useExpiry, expiryUnixSeconds)
+                    : BuildInstallCommand(record.Marker, authorizedLine, useExpiry, expiryUnixSeconds);
+                loginUser = record.UsesDedicatedAdminAccount ? record.BootstrapUser : record.User;
+            }
+            else
+            {
+                remote = record.UsesDedicatedAdminAccount
+                    ? BuildDedicatedCleanupCommand(record)
+                    : BuildRemovalCommand(record.Marker, record.Id);
+                loginUser = record.UsesDedicatedAdminAccount ? record.BootstrapUser : record.User;
+            }
+
             var args = BaseInteractiveArguments(record);
-            args.Add((record.UsesDedicatedAdminAccount ? record.BootstrapUser : record.User) + "@" + record.Host);
-            args.Add(EncodeRemoteCommand(remote));
-            return RunVisiblePowerShell(record, "remove", args,
-                "REMOVE TEMPORARY SSH ACCESS",
-                record.UsesDedicatedAdminAccount
-                    ? "Enter the SSH and sudo passwords. The temporary account, its processes, key, and sudo rule will be removed."
-                    : "Enter the SSH password. It is processed only by ssh.exe and is not stored.");
+            args.Add(loginUser + "@" + record.Host);
+            // ProcessStartInfo launches ssh.exe directly, so this is passed as one
+            // argv value without a local shell or an encoded decoder pipeline.
+            args.Add(remote);
+            return args;
+        }
+
+        private static string ReadValidatedPublicKey(SessionRecord record)
+        {
+            if (new FileInfo(record.PublicKeyPath).Length > 1024)
+            {
+                throw new InvalidOperationException("The public-key file is unexpectedly large.");
+            }
+            string contents = File.ReadAllText(record.PublicKeyPath);
+            string pattern = "\\Assh-ed25519 (?<key>[A-Za-z0-9+/]+={0,2}) " +
+                Regex.Escape(record.Marker) + "(?:\\r?\\n)?\\z";
+            Match match = Regex.Match(contents, pattern, RegexOptions.CultureInvariant);
+            if (!match.Success)
+            {
+                throw new InvalidOperationException("The public-key file must contain exactly the generated Ed25519 key and session marker.");
+            }
+
+            string keyWithoutComment = "ssh-ed25519 " + match.Groups["key"].Value;
+            RunResult derived = RunHidden(SshKeygenPath,
+                new[] { "-y", "-P", "", "-f", record.PrivateKeyPath }, 10000);
+            string derivedKey = derived.StandardOutput.Trim();
+            if (derived.ExitCode != 0 ||
+                (!string.Equals(derivedKey, keyWithoutComment, StringComparison.Ordinal) &&
+                 !string.Equals(derivedKey, keyWithoutComment + " " + record.Marker, StringComparison.Ordinal)))
+            {
+                throw new InvalidOperationException("The public key does not match the session private key.");
+            }
+            return keyWithoutComment + " " + record.Marker;
         }
 
         public static RunResult RemoveUsingTemporaryKey(SessionRecord record)
@@ -1108,18 +1500,30 @@ namespace AgentSshKeyManager
         public static string BuildDedicatedSetupCommand(SessionRecord record, string authorizedLine, bool useExpiry, long expiryUnixSeconds)
         {
             string sudoers = SudoersPath(record);
+            string owner = OwnershipPath(record);
             string sudoRule = record.User + " ALL=(ALL:ALL) NOPASSWD: ALL";
+            string markerLine = "# " + record.Marker;
+            string ownerValue = record.Marker + " user=" + record.User;
             return "set -eu; " + BuildAuthorizedLineAssignment(authorizedLine, useExpiry, expiryUnixSeconds) +
-                   "u=" + ShellQuote(record.User) + "; rule=" + ShellQuote(sudoers) + "; " +
-                   "sudo -v; " +
-                   "if ! id -u \"$u\" >/dev/null 2>&1; then sudo /usr/sbin/useradd --create-home --user-group --shell /bin/bash \"$u\"; fi; " +
+                   "u=" + ShellQuote(record.User) + "; rule=" + ShellQuote(sudoers) + "; owner=" + ShellQuote(owner) + "; " +
+                   "owner_value=" + ShellQuote(ownerValue) + "; sudo -v; " +
+                   "sudo install -d -m 700 -o root -g root /var/lib/agent-ssh-key-manager; " +
+                   "if id -u \"$u\" >/dev/null 2>&1; then " +
+                   "if sudo test -f \"$owner\"; then sudo grep -Fqx -- \"$owner_value\" \"$owner\"; " +
+                   "else sudo test -f \"$rule\"; sudo grep -Fqx -- " + ShellQuote(markerLine) + " \"$rule\"; " +
+                   "sudo grep -Fqx -- " + ShellQuote(sudoRule) + " \"$rule\"; " +
+                   "printf '%s\\n' \"$owner_value\" | sudo tee \"$owner\" >/dev/null; fi; " +
+                   "else if sudo test -e \"$owner\"; then sudo grep -Fqx -- \"$owner_value\" \"$owner\"; " +
+                   "else printf '%s\\n' \"$owner_value\" | sudo tee \"$owner\" >/dev/null; fi; " +
+                   "sudo /usr/sbin/useradd --create-home --user-group --shell /bin/bash \"$u\"; fi; " +
+                   "sudo chmod 600 \"$owner\"; " +
                    "p=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \\n'); [ -n \"$p\" ]; " +
                    "printf '%s:%s\\n' \"$u\" \"$p\" | sudo /usr/sbin/chpasswd; unset p; " +
                    "h=$(getent passwd \"$u\" | cut -d: -f6); [ -n \"$h\" ]; " +
                    "sudo install -d -m 700 -o \"$u\" -g \"$u\" \"$h/.ssh\"; " +
                    "tmp=$(sudo mktemp /etc/sudoers.d/.agent-ssh-XXXXXXXXXX); " +
                    "trap 'sudo rm -f \"$tmp\"' EXIT HUP INT TERM; " +
-                   "printf '%s\\n' " + ShellQuote("# " + record.Marker) + " " + ShellQuote(sudoRule) + " | sudo tee \"$tmp\" >/dev/null; " +
+                   "printf '%s\\n' " + ShellQuote(markerLine) + " " + ShellQuote(sudoRule) + " | sudo tee \"$tmp\" >/dev/null; " +
                    "sudo chmod 440 \"$tmp\"; sudo /usr/sbin/visudo -cf \"$tmp\" >/dev/null; sudo mv \"$tmp\" \"$rule\"; trap - EXIT HUP INT TERM; " +
                    "printf '%s\\n' \"$authorized_line\" | sudo tee \"$h/.ssh/authorized_keys\" >/dev/null; " +
                    "sudo chown \"$u:$u\" \"$h/.ssh/authorized_keys\"; sudo chmod 600 \"$h/.ssh/authorized_keys\"";
@@ -1154,14 +1558,24 @@ namespace AgentSshKeyManager
         public static string BuildDedicatedCleanupCommand(SessionRecord record)
         {
             string sudoers = SudoersPath(record);
-            return "set -eu; u=" + ShellQuote(record.User) + "; rule=" + ShellQuote(sudoers) + "; sudo -v; " +
-                   "h=$(getent passwd \"$u\" | cut -d: -f6 || true); " +
-                   "if [ -n \"$h\" ]; then sudo rm -f \"$h/.ssh/authorized_keys\"; fi; " +
-                   "sudo rm -f \"$rule\"; " +
+            string owner = OwnershipPath(record);
+            string sudoRule = record.User + " ALL=(ALL:ALL) NOPASSWD: ALL";
+            string markerLine = "# " + record.Marker;
+            string ownerValue = record.Marker + " user=" + record.User;
+            return "set -eu; u=" + ShellQuote(record.User) + "; rule=" + ShellQuote(sudoers) + "; owner=" + ShellQuote(owner) + "; " +
+                   "owner_value=" + ShellQuote(ownerValue) + "; sudo -v; " +
+                   "if sudo test -f \"$owner\"; then sudo grep -Fqx -- \"$owner_value\" \"$owner\"; " +
+                   "elif sudo test -f \"$rule\"; then sudo grep -Fqx -- " + ShellQuote(markerLine) + " \"$rule\"; " +
+                   "sudo grep -Fqx -- " + ShellQuote(sudoRule) + " \"$rule\"; " +
+                   "elif id -u \"$u\" >/dev/null 2>&1; then printf '%s\\n' 'Refusing to remove an unowned account.' >&2; exit 1; fi; " +
+                   "if sudo test -e \"$rule\"; then sudo grep -Fqx -- " + ShellQuote(markerLine) + " \"$rule\"; " +
+                   "sudo grep -Fqx -- " + ShellQuote(sudoRule) + " \"$rule\"; fi; " +
                    "if id -u \"$u\" >/dev/null 2>&1; then " +
+                   "h=$(getent passwd \"$u\" | cut -d: -f6); [ -n \"$h\" ]; sudo rm -f \"$h/.ssh/authorized_keys\"; " +
                    "sudo pkill -TERM -u \"$u\" >/dev/null 2>&1 || true; sleep 1; " +
                    "sudo pkill -KILL -u \"$u\" >/dev/null 2>&1 || true; " +
-                   "sudo /usr/sbin/userdel --remove \"$u\"; fi";
+                   "sudo /usr/sbin/userdel --remove \"$u\"; fi; " +
+                   "sudo rm -f \"$rule\" \"$owner\"";
         }
 
         public static string BuildRemovalCommand(string marker, string id)
@@ -1180,6 +1594,11 @@ namespace AgentSshKeyManager
             bool legacy = (record.Marker ?? "").StartsWith("codex-access:", StringComparison.Ordinal);
             string prefix = legacy ? "codex-access-" : "agent-ssh-";
             return "/etc/sudoers.d/" + prefix + record.Id.Substring(0, 16);
+        }
+
+        private static string OwnershipPath(SessionRecord record)
+        {
+            return "/var/lib/agent-ssh-key-manager/" + record.Id + ".owner";
         }
 
         public static string ConnectionCommand(SessionRecord record)
@@ -1215,16 +1634,6 @@ namespace AgentSshKeyManager
             return "'" + (value ?? "").Replace("'", "'\"'\"'") + "'";
         }
 
-        public static string EncodeRemoteCommand(string command)
-        {
-            if (string.IsNullOrWhiteSpace(command))
-            {
-                throw new ArgumentException("The remote command must not be empty.", "command");
-            }
-            string payload = Convert.ToBase64String(new UTF8Encoding(false).GetBytes(command));
-            return "printf %s " + payload + " | /usr/bin/base64 --decode | /bin/sh";
-        }
-
         public static string QuoteWindowsArgument(string value)
         {
             if (value == null) return "\"\"";
@@ -1256,7 +1665,7 @@ namespace AgentSshKeyManager
             return result.ToString();
         }
 
-        private static string BuildArgumentString(IEnumerable<string> arguments)
+        internal static string BuildArgumentString(IEnumerable<string> arguments)
         {
             return string.Join(" ", arguments.Select(QuoteWindowsArgument).ToArray());
         }
@@ -1268,6 +1677,7 @@ namespace AgentSshKeyManager
             info.Arguments = BuildArgumentString(arguments);
             info.UseShellExecute = false;
             info.CreateNoWindow = true;
+            info.RedirectStandardInput = true;
             info.RedirectStandardOutput = true;
             info.RedirectStandardError = true;
             info.StandardOutputEncoding = Encoding.UTF8;
@@ -1276,94 +1686,82 @@ namespace AgentSshKeyManager
             {
                 process.StartInfo = info;
                 process.Start();
-                string stdout = process.StandardOutput.ReadToEnd();
-                string stderr = process.StandardError.ReadToEnd();
+                process.StandardInput.Close();
+                Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync();
+                Task<string> stderrTask = process.StandardError.ReadToEndAsync();
                 bool exited = process.WaitForExit(timeoutMilliseconds);
                 if (!exited)
                 {
                     try { process.Kill(); } catch { }
+                    try { process.WaitForExit(5000); } catch { }
+                }
+                bool outputCompleted = false;
+                try { outputCompleted = Task.WaitAll(new Task[] { stdoutTask, stderrTask }, 5000); }
+                catch { }
+                string stdout = stdoutTask.Status == TaskStatus.RanToCompletion ? stdoutTask.Result : "";
+                string stderr = stderrTask.Status == TaskStatus.RanToCompletion ? stderrTask.Result : "";
+                if (!exited || !outputCompleted)
+                {
                     return new RunResult { ExitCode = -1, StandardOutput = stdout, StandardError = stderr, TimedOut = true };
                 }
                 return new RunResult { ExitCode = process.ExitCode, StandardOutput = stdout, StandardError = stderr, TimedOut = false };
             }
         }
 
-        private static int RunVisiblePowerShell(SessionRecord record, string action, List<string> sshArguments, string title, string explanation)
+        internal static ProcessStartInfo CreateInteractiveSshStartInfo(IEnumerable<string> sshArguments)
         {
-            string scriptPath = Path.Combine(record.SessionDirectory, "ssh-action-" + action + ".ps1");
-            string resultPath = Path.Combine(record.SessionDirectory, "ssh-action-" + action + ".result");
-            try { if (File.Exists(resultPath)) File.Delete(resultPath); } catch { }
-            var script = new StringBuilder();
-            script.AppendLine("$Host.UI.RawUI.WindowTitle = " + PsQuote("Agent SSH Key Manager"));
-            script.AppendLine("Write-Host ''");
-            script.AppendLine("Write-Host " + PsQuote(title) + " -ForegroundColor Cyan");
-            script.AppendLine("Write-Host " + PsQuote(explanation));
-            script.AppendLine("Write-Host ''");
-            script.AppendLine("$sshArgs = @(");
-            for (int i = 0; i < sshArguments.Count; i++)
-            {
-                string comma = i + 1 < sshArguments.Count ? "," : "";
-                script.AppendLine("    " + PsQuote(sshArguments[i]) + comma);
-            }
-            script.AppendLine(")");
-            script.AppendLine("& " + PsQuote(SshPath) + " @sshArgs");
-            script.AppendLine("$sshExit = $LASTEXITCODE");
-            script.AppendLine("Set-Content -LiteralPath " + PsQuote(resultPath) + " -Value ([string]$sshExit) -Encoding ASCII");
-            script.AppendLine("Write-Host ''");
-            script.AppendLine("if ($sshExit -eq 0) { Write-Host 'SSH operation successful.' -ForegroundColor Green } else { Write-Host ('SSH operation failed (code ' + $sshExit + ').') -ForegroundColor Red }");
-            script.AppendLine("[void](Read-Host 'Press ENTER to close')");
-            script.AppendLine("exit $sshExit");
-            File.WriteAllText(scriptPath, script.ToString(), new UTF8Encoding(true));
-
             var info = new ProcessStartInfo();
-            info.FileName = PowerShellPath;
-            info.Arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -File " + QuoteWindowsArgument(scriptPath);
-            info.UseShellExecute = true;
+            info.FileName = SshPath;
+            info.Arguments = BuildArgumentString(sshArguments);
+            info.UseShellExecute = false;
+            info.CreateNoWindow = false;
             info.WindowStyle = ProcessWindowStyle.Normal;
+            return info;
+        }
+
+        internal static int ProbeInteractiveSshLauncher()
+        {
+            return ProbeInteractiveSshLauncher(new[] { "-V" });
+        }
+
+        internal static int ProbeInteractiveSshLauncherFailure()
+        {
+            return ProbeInteractiveSshLauncher(new[] { "-o", "AgentSshKeyManagerInvalidOption=yes", "-V" });
+        }
+
+        private static int ProbeInteractiveSshLauncher(IEnumerable<string> arguments)
+        {
+            var info = CreateInteractiveSshStartInfo(arguments);
             using (var process = Process.Start(info))
             {
                 process.WaitForExit();
-                int code = process.ExitCode;
-                try
-                {
-                    int recordedCode;
-                    if (File.Exists(resultPath) && int.TryParse(File.ReadAllText(resultPath).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out recordedCode))
-                    {
-                        code = recordedCode;
-                    }
-                }
-                catch { }
-                try { File.Delete(scriptPath); } catch { }
-                try { File.Delete(resultPath); } catch { }
-                return code;
+                return process.ExitCode;
             }
         }
 
-        private static string PsQuote(string value)
+        internal static string GetSshVersion()
         {
-            return "'" + (value ?? "").Replace("'", "''") + "'";
+            if (string.IsNullOrWhiteSpace(SshPath)) return "unavailable";
+            RunResult result = RunHidden(SshPath, new[] { "-V" }, 10000);
+            return string.IsNullOrWhiteSpace(result.Combined) ? "unknown" : result.Combined;
         }
 
-        private static string FindTool(string name)
+        private static string FindWindowsOpenSshTool(string name)
         {
             string systemOpenSsh = Path.Combine(Environment.SystemDirectory, "OpenSSH", name);
             if (File.Exists(systemOpenSsh)) return systemOpenSsh;
-            string path = Environment.GetEnvironmentVariable("PATH") ?? "";
-            foreach (string item in path.Split(Path.PathSeparator))
-            {
-                try
-                {
-                    string candidate = Path.Combine(item.Trim(), name);
-                    if (File.Exists(candidate)) return candidate;
-                }
-                catch { }
-            }
             return null;
         }
     }
 
     public static class SelfTest
     {
+        [DllImport("shell32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CommandLineToArgvW(string commandLine, out int argumentCount);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr memory);
+
         public static int Run(string outputPath)
         {
             var report = new StringBuilder();
@@ -1373,21 +1771,24 @@ namespace AgentSshKeyManager
                 Directory.CreateDirectory(testRoot);
                 var record = new SessionRecord();
                 record.Id = Guid.NewGuid().ToString("N");
-                record.Alias = "agent-ssh-test";
+                string shortId = record.Id.Substring(0, 10);
+                record.Alias = "agent-ssh-" + shortId;
                 record.Host = "192.0.2.10";
                 record.BootstrapUser = "ubuntu";
                 record.AccessMode = "DedicatedAdmin";
-                record.User = "agentssh_test123456";
+                record.User = "agentssh_" + shortId;
                 record.Port = 22;
                 record.Marker = "agent-ssh-access:" + record.Id;
                 record.CreatedUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
                 record.ExpiresUtc = DateTime.UtcNow.AddHours(2).ToString("o", CultureInfo.InvariantCulture);
                 record.EnforceServerExpiry = true;
-                record.SessionDirectory = testRoot;
-                record.PrivateKeyPath = Path.Combine(testRoot, "id_ed25519");
+                record.State = "Preparing";
+                record.SessionDirectory = Path.Combine(testRoot, record.Id);
+                Directory.CreateDirectory(record.SessionDirectory);
+                record.PrivateKeyPath = Path.Combine(record.SessionDirectory, "id_ed25519");
                 record.PublicKeyPath = record.PrivateKeyPath + ".pub";
-                record.KnownHostsPath = Path.Combine(testRoot, "known_hosts");
-                record.ConfigPath = Path.Combine(testRoot, "ssh_config");
+                record.KnownHostsPath = Path.Combine(record.SessionDirectory, "known_hosts");
+                record.ConfigPath = Path.Combine(record.SessionDirectory, "ssh_config");
                 record.LastMessage = "Preparing with server-side expiry.";
 
                 SshTools.GenerateKeyAndFiles(record, true);
@@ -1397,12 +1798,40 @@ namespace AgentSshKeyManager
                 string config = File.ReadAllText(record.ConfigPath);
                 Assert(config.IndexOf("BatchMode yes", StringComparison.Ordinal) >= 0, "BatchMode missing");
                 Assert(config.IndexOf("PasswordAuthentication no", StringComparison.Ordinal) >= 0, "password auth not disabled");
+
+                string actualPrivatePath = record.PrivateKeyPath;
+                string actualPublicPath = record.PublicKeyPath;
+                string actualKnownHostsPath = record.KnownHostsPath;
+                string actualConfigPath = record.ConfigPath;
+                record.PrivateKeyPath = "C:\\untrusted-private-path";
+                record.PublicKeyPath = "C:\\untrusted-public-path";
+                record.KnownHostsPath = "C:\\untrusted-known-hosts";
+                record.ConfigPath = "C:\\untrusted-config";
+                SessionStore.Save(record);
+                record.PrivateKeyPath = actualPrivatePath;
+                record.PublicKeyPath = actualPublicPath;
+                record.KnownHostsPath = actualKnownHostsPath;
+                record.ConfigPath = actualConfigPath;
+                SessionRecord reloaded = SessionStore.LoadStoredRecord(Path.Combine(record.SessionDirectory, "session.xml"));
+                Assert(reloaded != null && reloaded.Id == record.Id, "stored session reload failed");
+                Assert(reloaded.PrivateKeyPath == actualPrivatePath && reloaded.ConfigPath == actualConfigPath, "stored paths were not normalized");
+                Assert(SessionStore.IsActionAllowed(reloaded, "install"), "preparing session cannot install");
+                reloaded.State = "Removed";
+                Assert(!SessionStore.IsActionAllowed(reloaded, "install") && !SessionStore.IsActionAllowed(reloaded, "remove"), "removed session action was accepted");
+                string actualUser = record.User;
+                record.User = "root";
+                SessionStore.Save(record);
+                Assert(SessionStore.LoadStoredRecord(Path.Combine(record.SessionDirectory, "session.xml")) == null, "unbound dedicated account was accepted");
+                record.User = actualUser;
+                SessionStore.Save(record);
+
                 string install = SshTools.BuildInstallCommand(record.Marker, "ssh-ed25519 AAAATEST " + record.Marker);
                 string expiryInstall = SshTools.BuildInstallCommand(record.Marker, "ssh-ed25519 AAAATEST " + record.Marker, true, 4102444799L);
                 string removal = SshTools.BuildRemovalCommand(record.Marker, record.Id);
                 string dedicatedSetup = SshTools.BuildDedicatedSetupCommand(record, "ssh-ed25519 AAAATEST " + record.Marker);
                 string dedicatedCleanup = SshTools.BuildDedicatedCleanupCommand(record);
-                string encodedSetup = SshTools.EncodeRemoteCommand(dedicatedSetup);
+                List<string> interactiveInstall = SshTools.BuildInteractiveArguments(record, "install");
+                string directSetup = interactiveInstall[interactiveInstall.Count - 1];
                 Assert(install.IndexOf(record.Marker, StringComparison.Ordinal) >= 0, "install marker missing");
                 Assert(expiryInstall.IndexOf("date -d @4102444799", StringComparison.Ordinal) >= 0, "server-local expiry conversion missing");
                 Assert(expiryInstall.IndexOf("expiry-time=", StringComparison.Ordinal) >= 0, "expiry key option missing");
@@ -1410,18 +1839,107 @@ namespace AgentSshKeyManager
                 Assert(dedicatedSetup.IndexOf("useradd", StringComparison.Ordinal) >= 0, "dedicated user creation missing");
                 Assert(dedicatedSetup.IndexOf("chpasswd", StringComparison.Ordinal) >= 0, "random account password setup missing");
                 Assert(dedicatedSetup.IndexOf("visudo", StringComparison.Ordinal) >= 0, "sudoers validation missing");
+                Assert(dedicatedSetup.IndexOf("grep -Fqx", StringComparison.Ordinal) >= 0, "existing dedicated account ownership proof missing");
+                Assert(dedicatedSetup.IndexOf("/var/lib/agent-ssh-key-manager/", StringComparison.Ordinal) >= 0, "durable dedicated account ownership marker missing");
                 Assert(dedicatedSetup.IndexOf("visudo", StringComparison.Ordinal) < dedicatedSetup.IndexOf("authorized_keys", StringComparison.Ordinal), "public key exposed before sudoers validation");
                 Assert(dedicatedCleanup.IndexOf("userdel", StringComparison.Ordinal) >= 0, "dedicated cleanup missing");
-                Assert(encodedSetup.StartsWith("printf %s ", StringComparison.Ordinal), "encoded remote command prefix missing");
-                Assert(encodedSetup.IndexOf("/usr/bin/base64 --decode | /bin/sh", StringComparison.Ordinal) >= 0, "encoded remote command decoder missing");
-                Assert(encodedSetup.IndexOf(record.Marker, StringComparison.Ordinal) < 0, "remote command was not encoded");
+                Assert(dedicatedCleanup.IndexOf("grep -Fqx", StringComparison.Ordinal) >= 0, "dedicated cleanup ownership proof missing");
+                Assert(dedicatedCleanup.IndexOf("/var/lib/agent-ssh-key-manager/", StringComparison.Ordinal) >= 0, "dedicated cleanup ownership marker missing");
+                Assert(directSetup.StartsWith("set -eu; ", StringComparison.Ordinal), "direct remote command prefix missing");
+                Assert(directSetup.IndexOf(record.Marker, StringComparison.Ordinal) >= 0, "direct remote command marker missing");
+                var startInfo = SshTools.CreateInteractiveSshStartInfo(interactiveInstall);
+                Assert(string.Equals(startInfo.FileName, Path.Combine(Environment.SystemDirectory, "OpenSSH", "ssh.exe"), StringComparison.OrdinalIgnoreCase), "interactive launcher is not the system OpenSSH client");
+                Assert(!startInfo.UseShellExecute, "interactive launcher uses the Windows shell");
+                Assert(!startInfo.CreateNoWindow, "interactive launcher suppresses the inherited console");
+                var managerChild = InteractiveConsoleLauncher.CreateStartInfo(record, "install");
+                Assert(string.Equals(managerChild.FileName, Application.ExecutablePath, StringComparison.OrdinalIgnoreCase), "interactive console host is not the same executable");
+                Assert(!managerChild.UseShellExecute, "interactive console host uses the Windows shell");
+                Assert(managerChild.CreateNoWindow, "interactive console host creates an unwanted inherited window");
+                Assert(string.Equals(managerChild.Arguments, "--interactive-install " + record.Id, StringComparison.Ordinal), "interactive console host arguments changed");
+                AssertArgumentRoundTrip(interactiveInstall);
+                AssertArgumentRoundTrip(new[] { "plain", "space value", "Unicode-ä", "a&b|c", "quote\"value", "C:\\path with space\\" });
+                Assert(SshTools.ProbeInteractiveSshLauncher() == 0, "interactive ssh launcher probe failed");
+                Assert(SshTools.ProbeInteractiveSshLauncherFailure() != 0, "interactive ssh failure probe unexpectedly succeeded");
+                var childProbe = new ProcessStartInfo();
+                childProbe.FileName = Application.ExecutablePath;
+                childProbe.Arguments = "--self-test-child-exit-probe";
+                childProbe.UseShellExecute = false;
+                childProbe.CreateNoWindow = true;
+                Assert(InteractiveConsoleLauncher.WaitForExit(childProbe) == 37, "same-executable child exit code was not preserved");
                 Assert(SshTools.ConnectionCommand(record).IndexOf(record.ConfigPath, StringComparison.Ordinal) >= 0, "agent command missing config");
+
+                string publicKeyContents = File.ReadAllText(record.PublicKeyPath);
+                File.WriteAllText(record.PublicKeyPath, publicKeyContents + "ssh-ed25519 AAAA attacker\n", new UTF8Encoding(false));
+                bool multilineKeyRejected = false;
+                try { SshTools.BuildInteractiveArguments(record, "install"); }
+                catch (InvalidOperationException) { multilineKeyRejected = true; }
+                Assert(multilineKeyRejected, "multiline public-key file was accepted");
+                File.WriteAllText(record.PublicKeyPath, publicKeyContents, new UTF8Encoding(false));
+
+                Match keyMatch = Regex.Match(publicKeyContents, "\\Assh-ed25519 (?<key>[A-Za-z0-9+/]+={0,2}) ");
+                Assert(keyMatch.Success, "generated public-key test format missing");
+                string keyData = keyMatch.Groups["key"].Value;
+                char replacement = keyData[0] == 'A' ? 'B' : 'A';
+                string mismatchedKey = "ssh-ed25519 " + replacement + keyData.Substring(1) + " " + record.Marker + Environment.NewLine;
+                File.WriteAllText(record.PublicKeyPath, mismatchedKey, new UTF8Encoding(false));
+                bool mismatchedKeyRejected = false;
+                try { SshTools.BuildInteractiveArguments(record, "install"); }
+                catch (InvalidOperationException) { mismatchedKeyRejected = true; }
+                Assert(mismatchedKeyRejected, "public key that did not match the private key was accepted");
+                File.WriteAllText(record.PublicKeyPath, publicKeyContents, new UTF8Encoding(false));
+
+                string encryptedPrivateKey = Path.Combine(record.SessionDirectory, "id_ed25519_encrypted_test");
+                var encryptedKeyInfo = new ProcessStartInfo();
+                encryptedKeyInfo.FileName = Path.Combine(Environment.SystemDirectory, "OpenSSH", "ssh-keygen.exe");
+                encryptedKeyInfo.Arguments = SshTools.BuildArgumentString(new[] {
+                    "-q", "-t", "ed25519", "-N", "self-test-passphrase", "-C", record.Marker, "-f", encryptedPrivateKey
+                });
+                encryptedKeyInfo.UseShellExecute = false;
+                encryptedKeyInfo.CreateNoWindow = true;
+                Assert(InteractiveConsoleLauncher.WaitForExit(encryptedKeyInfo) == 0, "encrypted self-test key generation failed");
+                string originalPrivateKeyPath = record.PrivateKeyPath;
+                string originalPublicKeyPath = record.PublicKeyPath;
+                record.PrivateKeyPath = encryptedPrivateKey;
+                record.PublicKeyPath = encryptedPrivateKey + ".pub";
+                bool encryptedKeyRejected = false;
+                var encryptedKeyTimer = Stopwatch.StartNew();
+                try { SshTools.BuildInteractiveArguments(record, "install"); }
+                catch (InvalidOperationException) { encryptedKeyRejected = true; }
+                encryptedKeyTimer.Stop();
+                record.PrivateKeyPath = originalPrivateKeyPath;
+                record.PublicKeyPath = originalPublicKeyPath;
+                Assert(encryptedKeyRejected, "passphrase-protected replacement key was accepted");
+                Assert(encryptedKeyTimer.ElapsedMilliseconds < 5000, "passphrase-protected replacement key prompted or timed out");
+
+                string auditHash = InteractiveAudit.HashText("PRIVATE_PAYLOAD_TEST");
+                string auditDetails = InteractiveAudit.BuildStartupDetails("PRIVATE_PAYLOAD_TEST");
+                Assert(auditDetails.IndexOf(auditHash, StringComparison.Ordinal) >= 0, "startup audit payload hash missing");
+                Assert(auditDetails.IndexOf("PRIVATE_PAYLOAD_TEST", StringComparison.Ordinal) < 0, "startup audit details leaked the raw payload");
+                Assert(InteractiveAudit.TryAppend(record, "install", "self_test", 123, auditDetails), "audit append failed");
+                string audit = File.ReadAllText(InteractiveAudit.PathFor(record));
+                Assert(audit.IndexOf(auditHash, StringComparison.Ordinal) >= 0, "audit payload hash missing");
+                Assert(audit.IndexOf("PRIVATE_PAYLOAD_TEST", StringComparison.Ordinal) < 0, "audit leaked the raw payload");
+                File.Delete(InteractiveAudit.PathFor(record));
+                Directory.CreateDirectory(InteractiveAudit.PathFor(record));
+                Assert(!InteractiveAudit.TryAppend(record, "install", "expected_failure", null, null), "audit write failure was not contained");
+                Directory.Delete(InteractiveAudit.PathFor(record));
+
+                string legacyScript = Path.Combine(record.SessionDirectory, "ssh-action-install." + "ps1");
+                string legacyResult = Path.Combine(record.SessionDirectory, "ssh-action-install." + "result");
+                File.WriteAllText(legacyScript, "legacy");
+                File.WriteAllText(legacyResult, "1");
+                SessionStore.DeleteSecretMaterial(record);
+                Assert(!File.Exists(legacyScript) && !File.Exists(legacyResult), "legacy helper cleanup failed");
                 report.AppendLine("SELF-TEST OK");
                 report.AppendLine("Fingerprint: " + record.Fingerprint);
                 report.AppendLine("Config safeguards: OK");
                 report.AppendLine("Install/remove marker logic: OK");
                 report.AppendLine("Optional expiry command generation: OK");
-                report.AppendLine("PowerShell-safe remote command transport: OK");
+                report.AppendLine("Direct remote command transport: OK");
+                report.AppendLine("Windows argument round-trip: OK");
+                report.AppendLine("Constrained manager/OpenSSH launch and exit propagation: OK");
+                report.AppendLine("Stored-session and public-key validation: OK");
+                report.AppendLine("Audit privacy/failure containment and legacy cleanup: OK");
                 report.AppendLine("Dedicated maintenance account lifecycle: OK");
                 File.WriteAllText(outputPath, report.ToString(), new UTF8Encoding(true));
                 return 0;
@@ -1451,6 +1969,28 @@ namespace AgentSshKeyManager
         private static void Assert(bool condition, string message)
         {
             if (!condition) throw new InvalidOperationException(message);
+        }
+
+        private static void AssertArgumentRoundTrip(IEnumerable<string> arguments)
+        {
+            string[] expected = arguments.ToArray();
+            string commandLine = "ssh.exe" + (expected.Length == 0 ? "" : " " + SshTools.BuildArgumentString(expected));
+            int count;
+            IntPtr argv = CommandLineToArgvW(commandLine, out count);
+            if (argv == IntPtr.Zero) throw new InvalidOperationException("CommandLineToArgvW failed.");
+            try
+            {
+                Assert(count == expected.Length + 1, "Windows argument count changed during quoting");
+                for (int i = 0; i < expected.Length; i++)
+                {
+                    string actual = Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv, (i + 1) * IntPtr.Size));
+                    Assert(string.Equals(actual, expected[i], StringComparison.Ordinal), "Windows argument changed during quoting at index " + i.ToString(CultureInfo.InvariantCulture));
+                }
+            }
+            finally
+            {
+                LocalFree(argv);
+            }
         }
     }
 }
