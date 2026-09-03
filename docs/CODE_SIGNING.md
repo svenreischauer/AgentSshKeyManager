@@ -42,26 +42,28 @@ The thumbprint is not a secret. The private key and any PIN are. Certificate ren
 When no suitable certificate is available and publishing cannot wait, an unsigned release must be requested explicitly:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1 `
-    -ReleaseVersion 1.0.1 `
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Build.ps1 `
+    -ReleaseVersion 1.1.0 `
     -UnsignedRelease
 ```
 
 The command creates these files after the staged executable passes its self-test:
 
 ```text
-dist\v1.0.1\AgentSshKeyManager-UNSIGNED.exe
-dist\v1.0.1\AgentSshKeyManager-UNSIGNED.exe.sha256
+dist\v1.1.0\AgentSshKeyManager-UNSIGNED.exe
+dist\v1.1.0\AgentSshKeyManager-UNSIGNED.exe.sha256
+dist\v1.1.0\LICENSE
+dist\v1.1.0\THIRD-PARTY-NOTICES.md
 ```
 
-The executable has assembly and manifest version `1.0.1.0`, product version `1.0.1-unsigned`, and an unsigned-release description/configuration. `-UnsignedRelease` is mutually exclusive with the development switch, certificate thumbprint, SignTool path, and timestamp options. The version directory must not already exist.
+The executable has assembly and manifest version `1.1.0.0`, product version `1.1.0-unsigned`, and an unsigned-release description/configuration. `-UnsignedRelease` is mutually exclusive with the development switch, certificate thumbprint, SignTool path, and timestamp options. The version directory must not already exist.
 
 This mode does not create publisher trust. Windows, SmartScreen, Sophos, or another security product may warn, quarantine, or block the executable. The checksum detects a mismatch only when the expected checksum itself came from a trusted channel; an attacker able to replace both release assets can replace both values. Keep `-UNSIGNED` in the filename and release notes. The basename `AgentSshKeyManager.exe` remains reserved for the signed mode.
 
 You can confirm the expected unsigned state and checksum without interpreting `NotSigned` as a security approval:
 
 ```powershell
-$executable = '.\dist\v1.0.1\AgentSshKeyManager-UNSIGNED.exe'
+$executable = '.\dist\v1.1.0\AgentSshKeyManager-UNSIGNED.exe'
 $checksum = $executable + '.sha256'
 $signature = Get-AuthenticodeSignature -LiteralPath $executable
 if ($signature.Status -ne 'NotSigned') { throw "Unexpected signature status: $($signature.Status)" }
@@ -76,13 +78,13 @@ if ($actualHash -ne $expectedHash) { throw 'SHA-256 checksum mismatch.' }
 First create an unsigned development build. The build runs its self-test before publishing the development artifact:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1 -UnsignedDevelopmentBuild
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Build.ps1 -UnsignedDevelopmentBuild
 ```
 
 Then create the signed release. Use a new semantic version; the build refuses to replace an existing version directory:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1 `
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Build.ps1 `
     -ReleaseVersion 1.1.0 `
     -CertificateThumbprint '40_HEXADECIMAL_CHARACTERS' `
     -SignToolPath 'C:\Program Files (x86)\Windows Kits\10\bin\<SDK-version>\x64\signtool.exe'
@@ -125,4 +127,4 @@ Confirm that the signer subject is the publisher identity you expect. A checksum
 5. On an authorized disposable Ubuntu host, run Create, automatic key verification, and Remove in both dedicated-account and existing-user modes. Cover server-side expiry enabled and disabled. Verify key rejection after removal and, for dedicated mode, confirm that the temporary account, processes, home directory, key, `/etc/sudoers.d` entry, and `/var/lib/agent-ssh-key-manager/*.owner` marker are gone.
 6. Exercise the interactive failure paths: wrong SSH or sudo password, host-key rejection, unreachable host, cancellation/window close, and a remote nonzero exit. Confirm that the main GUI survives, the console keeps detailed output visible until ENTER, and the numeric exit result reaches the GUI.
 7. Test the exact release executable on the Sophos-protected endpoint under the intended policy. Run both Create and Remove, then check local events and Sophos Central. If Sophos blocks intended behavior, retain the event details and submit the exact sample/hash for false-positive review. Do not disable protection or add a broad exclusion.
-8. Upload the executable and its matching `.sha256` file from the version directory without renaming either. Download them again and repeat the appropriate signed or unsigned verification before announcing the release.
+8. Upload the executable, its matching `.sha256` file, `LICENSE`, and `THIRD-PARTY-NOTICES.md` from the version directory without renaming them. Download them again and repeat the appropriate signed or unsigned verification before announcing the release.

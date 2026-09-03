@@ -11,7 +11,66 @@ $ErrorActionPreference = 'Stop'
 
 $projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $distDir = Join-Path $projectDir 'dist'
-$source = Join-Path $projectDir 'Program.cs'
+$sources = @(
+    (Join-Path $projectDir 'Program.cs'),
+    (Join-Path $projectDir 'EmbeddedDependencyLoader.cs'),
+    (Join-Path $projectDir 'ExistingKeyBootstrap.cs'),
+    (Join-Path $projectDir 'BootstrapDialogs.cs'),
+    (Join-Path $projectDir 'MainFormBootstrap.cs')
+)
+$dependencyDir = Join-Path $projectDir 'lib\sshnet-2026.0.0'
+$dependencyNames = @(
+    'Renci.SshNet.dll',
+    'BouncyCastle.Cryptography.dll',
+    'Microsoft.Bcl.AsyncInterfaces.dll',
+    'Microsoft.Bcl.Cryptography.dll',
+    'Microsoft.Extensions.DependencyInjection.Abstractions.dll',
+    'Microsoft.Extensions.Logging.Abstractions.dll',
+    'System.Buffers.dll',
+    'System.Formats.Asn1.dll',
+    'System.Memory.dll',
+    'System.Numerics.Vectors.dll',
+    'System.Runtime.CompilerServices.Unsafe.dll',
+    'System.Threading.Tasks.Extensions.dll',
+    'System.ValueTuple.dll'
+)
+$dependencyPaths = @($dependencyNames | ForEach-Object { Join-Path $dependencyDir $_ })
+$expectedDependencyHashes = @{
+    'BouncyCastle.Cryptography.dll' = '4f96977e9c67334742c683410b3a361258219f0d3084a5e0bc10fba96cf23a0d'
+    'Microsoft.Bcl.AsyncInterfaces.dll' = '80678203bd0203a6594f4e330b22543c0de5059382bb1c9334b7868b8f31b1bc'
+    'Microsoft.Bcl.Cryptography.dll' = '1f9464239423039ae8fe6eca2573de5f498155b15604bdc3740e7cbe8a3e5300'
+    'Microsoft.Extensions.DependencyInjection.Abstractions.dll' = '19edd4f5e69a4589dc314909b5854a22f89c4b9ab040591771397b2cb1a17ba6'
+    'Microsoft.Extensions.Logging.Abstractions.dll' = 'b4e0e778afdc76403792390b056f68de0ced742d16c5b0347d9cca6930f4761b'
+    'Renci.SshNet.dll' = '582581d9d533f05411ec577cdb88dd86b49b35d0d9656c3e0515e02f799191a2'
+    'System.Buffers.dll' = '2d78d770c9cb997199154ae8c018b9f1d1efbc86729f7264dde6dbad2a12cac3'
+    'System.Formats.Asn1.dll' = '8a83da38d527d78bc66dfbdaf041396c75a0f11acadc558479277ebb7e1ad8ec'
+    'System.Memory.dll' = 'd5e8e4866f9cfa66f7765660f84b210198893e55335487afe5ebda342c0e913d'
+    'System.Numerics.Vectors.dll' = '20c2fa81b8c70d651099d762954f285fd4f942e63b2d7217c145dab8d4b2f4c9'
+    'System.Runtime.CompilerServices.Unsafe.dll' = '08cbd7278b66f1e68425a82d4b97181a4130d93e3dd91831407aba7212ccdacf'
+    'System.Threading.Tasks.Extensions.dll' = '4f81ffd0dc7204db75afc35ea4291769b07c440592f28894260eea76626a23c6'
+    'System.ValueTuple.dll' = '400e432af60a6a2b3eedec5908be7e7ae0d063ecf0052595f7cd6cffb7e4e98e'
+}
+$licenseFile = Join-Path $projectDir 'LICENSE'
+$thirdPartyNoticesFile = Join-Path $projectDir 'THIRD-PARTY-NOTICES.md'
+foreach ($requiredFile in $sources + $dependencyPaths + @($licenseFile, $thirdPartyNoticesFile)) {
+    if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+        throw "Required build input is missing: $requiredFile"
+    }
+}
+foreach ($dependencyPath in $dependencyPaths) {
+    $dependencyName = [System.IO.Path]::GetFileName($dependencyPath)
+    $actualHash = (Get-FileHash -LiteralPath $dependencyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if (-not $expectedDependencyHashes.ContainsKey($dependencyName) -or
+        -not $actualHash.Equals($expectedDependencyHashes[$dependencyName], [System.StringComparison]::Ordinal)) {
+        throw "Dependency integrity check failed: $dependencyName"
+    }
+}
+$thirdPartyNoticesText = [System.IO.File]::ReadAllText($thirdPartyNoticesFile)
+if (-not $thirdPartyNoticesText.Contains('Copyright (c) 2000-2026 The Legion of the Bouncy Castle Inc. (https://www.bouncycastle.org).') -or
+    -not $thirdPartyNoticesText.Contains('publish, distribute, sublicense, and/or sell') -or
+    $thirdPartyNoticesText.Contains('sub license')) {
+    throw 'THIRD-PARTY-NOTICES.md does not contain the exact Bouncy Castle 2.7.0 copyright and MIT license notice.'
+}
 $manifest = Join-Path $projectDir 'app.manifest'
 $officialOutputName = 'AgentSshKeyManager.exe'
 $unsignedReleaseOutputName = 'AgentSshKeyManager-UNSIGNED.exe'
@@ -306,21 +365,28 @@ using System.Reflection;
 
     Push-Location -LiteralPath $stagingDir
     try {
-        & $compiler `
-            /nologo `
-            /target:winexe `
-            /platform:anycpu `
-            /optimize+ `
-            /warn:4 `
-            "/win32manifest:$generatedManifest" `
-            "/out:$stagedOutput" `
-            /reference:System.dll `
-            /reference:System.Core.dll `
-            /reference:System.Drawing.dll `
-            /reference:System.Windows.Forms.dll `
-            /reference:System.Xml.dll `
-            $source `
-            $generatedAssemblyInfo
+        $compilerArguments = @(
+            '/nologo',
+            '/target:winexe',
+            '/platform:anycpu',
+            '/optimize+',
+            '/warn:4',
+            "/win32manifest:$generatedManifest",
+            "/out:$stagedOutput",
+            '/reference:System.dll',
+            '/reference:System.Core.dll',
+            '/reference:System.Drawing.dll',
+            '/reference:System.Windows.Forms.dll',
+            '/reference:System.Xml.dll'
+        )
+        foreach ($dependencyPath in $dependencyPaths) {
+            $compilerArguments += "/reference:$dependencyPath"
+            $resourceName = [System.IO.Path]::GetFileNameWithoutExtension($dependencyPath)
+            $compilerArguments += "/resource:$dependencyPath,AgentSshKeyManager.Dependencies.$resourceName.dll,private"
+        }
+        $compilerArguments += @($sources | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+        $compilerArguments += $generatedAssemblyInfo
+        & $compiler @compilerArguments
         $compilerExitCode = $LASTEXITCODE
     }
     finally {
@@ -333,6 +399,14 @@ using System.Reflection;
 
     Remove-Item -LiteralPath $generatedAssemblyInfo -Force
     Remove-Item -LiteralPath $generatedManifest -Force
+    [System.IO.File]::Copy($licenseFile, (Join-Path $stagingDir 'LICENSE'), $false)
+    $stagedThirdPartyNotices = Join-Path $stagingDir 'THIRD-PARTY-NOTICES.md'
+    [System.IO.File]::Copy($thirdPartyNoticesFile, $stagedThirdPartyNotices, $false)
+    $sourceNoticeHash = (Get-FileHash -LiteralPath $thirdPartyNoticesFile -Algorithm SHA256).Hash
+    $stagedNoticeHash = (Get-FileHash -LiteralPath $stagedThirdPartyNotices -Algorithm SHA256).Hash
+    if (-not $sourceNoticeHash.Equals($stagedNoticeHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The staged third-party notice does not match the reviewed source notice.'
+    }
 
     if ($isSignedRelease) {
         & $resolvedSignTool sign /sha1 $normalizedThumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $stagedOutput
