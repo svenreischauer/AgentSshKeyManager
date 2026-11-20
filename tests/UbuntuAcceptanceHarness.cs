@@ -60,6 +60,7 @@ namespace AgentSshKeyManager
                 TestEncryptedOpenSshExistingUserAccess();
                 TestManualFallback();
                 TestExpiryFallbackAndDefinitiveCleanup();
+                TestAutomaticDedicatedExpiry();
                 TestRollbackAfterPartialFailure();
                 TestPasswordAuthenticationCompatibility();
                 TestNoResidualAccess();
@@ -509,6 +510,62 @@ namespace AgentSshKeyManager
             Report.Add("Bootstrap secrets absent from command-line arguments and saved metadata: OK");
         }
 
+        private static void TestAutomaticDedicatedExpiry()
+        {
+            SessionRecord record = CreateRecord("root", true, true);
+            record.ExpiresUtc = DateTime.UtcNow.AddSeconds(90).ToString("o", CultureInfo.InvariantCulture);
+            AddCleanup(record, _rootKey, "", "", _rootHostKey);
+            PrepareRecord(record, _rootHostKey);
+            BootstrapOperationResult installed = ExistingKeyBootstrapper.Install(record, _rootKey, "", "", _rootHostKey);
+            Assert(installed.Success, "Dedicated access with automatic expiry could not be installed: " + installed.Message);
+            Assert(IsTemporaryAccessAccepted(record), "Dedicated key with automatic expiry was not accepted before its end time.");
+
+            string unit = SshTools.ExpiryUnitName(record);
+            string script = SshTools.ExpiryScriptPath(record);
+            string armed = RunKeyCommand("root", _rootKey, "", _rootHostKey,
+                "systemctl is-active --quiet " + unit + ".timer && systemctl is-enabled --quiet " + unit + ".timer && " +
+                "test -f " + SshTools.ShellQuote(script) + " && test \"$(stat -c %a:%U " + SshTools.ShellQuote(script) + ")\" = 700:root && " +
+                "id -u " + SshTools.ShellQuote(record.User) + " && printf EXPIRY_ARMED");
+            Assert(armed.Contains("EXPIRY_ARMED"), "The automatic expiry timer is not active, enabled, and root-owned.");
+            string uid = NormalizeText(armed.Replace("EXPIRY_ARMED", "")).Trim();
+            Assert(uid.Length > 0 && uid.All(char.IsDigit), "The dedicated account UID could not be read.");
+
+            // A detached process of the temporary user stands in for an open agent session.
+            string started = RunKeyCommand("root", _rootKey, "", _rootHostKey,
+                "runuser -u " + SshTools.ShellQuote(record.User) + " -- setsid sleep 900 </dev/null >/dev/null 2>&1 & " +
+                "sleep 1; pgrep -U " + uid + " >/dev/null && printf STARTED");
+            Assert(started.Contains("STARTED"), "A background process could not be started for the temporary account.");
+
+            DateTime deadline = record.ExpiresUtcValue.AddSeconds(150);
+            bool removed = false;
+            while (DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(5000);
+                string state = RunKeyCommand("root", _rootKey, "", _rootHostKey,
+                    "if id -u " + SshTools.ShellQuote(record.User) + " >/dev/null 2>&1; then printf PRESENT; else printf GONE; fi");
+                if (state.Contains("GONE")) { removed = true; break; }
+            }
+            Assert(removed, "The expiry timer did not remove the dedicated account after its end time.");
+            Assert(DateTime.UtcNow >= record.ExpiresUtcValue, "The dedicated account was removed before its end time.");
+
+            string clean = RunKeyCommand("root", _rootKey, "", _rootHostKey,
+                "! pgrep -U " + uid + " >/dev/null && " +
+                "test ! -e /home/" + record.User + " && " +
+                "test ! -e /etc/sudoers.d/agent-ssh-" + record.Id.Substring(0, 16) + " && " +
+                "test ! -e /var/lib/agent-ssh-key-manager/" + record.Id + ".owner && " +
+                "test ! -e " + SshTools.ShellQuote(script) + " && " +
+                "test ! -e /etc/systemd/system/" + unit + ".timer && test ! -e /etc/systemd/system/" + unit + ".service && " +
+                "! systemctl is-active --quiet " + unit + ".timer && printf EXPIRED_CLEAN");
+            Assert(clean.Contains("EXPIRED_CLEAN"), "Automatic expiry left a process, account artifact, or timer behind.");
+            Assert(!IsTemporaryAccessAccepted(record), "The temporary key was still accepted after automatic expiry.");
+
+            BootstrapOperationResult manualAfterExpiry = ExistingKeyBootstrapper.Remove(record, _rootKey, "", "", _rootHostKey);
+            Assert(manualAfterExpiry.Success, "Delete access after automatic expiry was not confirmed: " + manualAfterExpiry.Message);
+            RemoveCleanup(record);
+            SessionStore.DeleteSecretMaterial(record);
+            Report.Add("Dedicated account automatic expiry: account, sudo rule, processes, key, and timer removed on time: OK");
+        }
+
         private static void TestNoResidualAccess()
         {
             string check = RunKeyCommand("root", _rootKey, "", _rootHostKey,
@@ -516,6 +573,8 @@ namespace AgentSshKeyManager
                 "if find /etc/sudoers.d -maxdepth 1 -type f -name 'agent-ssh-*' -print -quit | grep -q .; then exit 1; fi; " +
                 "if find /var/lib/agent-ssh-key-manager -maxdepth 1 -type f -name '*.owner' -print -quit 2>/dev/null | grep -q .; then exit 1; fi; " +
                 "if find /home -maxdepth 1 -mindepth 1 -type d -name 'agentssh_*' -print -quit 2>/dev/null | grep -q .; then exit 1; fi; " +
+                "if find /etc/systemd/system -maxdepth 1 -name 'agent-ssh-expire-*' -print -quit | grep -q .; then exit 1; fi; " +
+                "if find /var/lib/agent-ssh-key-manager -maxdepth 1 -type f -name '*.expire' -print -quit 2>/dev/null | grep -q .; then exit 1; fi; " +
                 "! grep -Fq 'agent-ssh-access:' /root/.ssh/authorized_keys; " +
                 "! grep -Fq 'agent-ssh-access:' /home/bootstrap/.ssh/authorized_keys; " +
                 "test ! -e /etc/ssh/sshd_config.d/00-agent-ssh-password-test.conf; " +

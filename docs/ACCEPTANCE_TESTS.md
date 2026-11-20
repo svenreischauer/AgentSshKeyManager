@@ -35,6 +35,7 @@ The VM and credential fixtures were created outside the repository. The QEMU lab
 | Incorrect sudo password diagnostic | Passed |
 | Existing-user target mode | Passed |
 | Optional server-side key expiry | Passed |
+| Dedicated account removed by the systemd expiry timer at the end time (account, sudo rule, processes, key, timer) | Not yet run (added 2026-11-20) |
 | Generated-key login verification before activation | Passed |
 | Mismatched raw server host key rejected | Passed |
 | Marker-only removal preserving the original `authorized_keys` content | Passed |

@@ -90,9 +90,12 @@ The generated private key is deliberately unencrypted so an automation agent can
 
 ## Expiry
 
-The duration is always recorded as a local planned end time. **OpenSSH expiry option** is enabled by default, so the program also adds an `expiry-time` restriction to the authorized key when the server supports it. An expiry blocks new logins but does not terminate an SSH session that is already open.
+The duration is always recorded as a local planned end time. **Expire automatically on the server** is enabled by default and makes the server enforce it:
 
-If the server rejects the optional expiry syntax, the program can roll back and retry without it. Always use **Delete access** when the work is complete, even when server-side expiry is enabled.
+- **Dedicated temporary account (recommended):** the key gets an OpenSSH `expiry-time` restriction, and a root systemd timer (`agent-ssh-expire-<session>.timer`) runs at the end time. It performs the same verified cleanup as **Delete access**: it ends all processes of the temporary account (including open SSH sessions), deletes the account, its home directory, key, and `/etc/sudoers.d` rule, and then removes itself. The timer also runs one minute after boot, so an end time that passed while the server was off is enforced at the next start. This mode needs systemd, which every supported Ubuntu release has.
+- **Existing user:** only the OpenSSH `expiry-time` restriction is possible, because the agent shares your account. New logins with the key are blocked after the end time, but open SSH sessions continue and the key entry stays in `authorized_keys` until you delete the access.
+
+If the server rejects the expiry syntax or has no systemd, the program can roll back and retry without automatic expiry; the access then lasts until you delete it. **Delete access** remains safe to use before or after the end time.
 
 ## Diagnostics
 
@@ -183,7 +186,7 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Build.ps1 `
 
 Release directories contain the EXE, its `.sha256` checksum, `LICENSE`, and `THIRD-PARTY-NOTICES.md`. The official `AgentSshKeyManager.exe` basename is reserved for a successfully signed build.
 
-The local self-test covers key generation, key/config ACL paths, OpenSSH and encrypted PEM parsing, PuTTY PPK parsing, server-key pin data, argument quoting, atomic marker replacement, session-bound cleanup confirmation, three-state access verification, expiry generation and handoff updates, legacy-session loading, audit privacy, and the constrained same-EXE/system-OpenSSH process model.
+The local self-test covers key generation, key/config ACL paths, OpenSSH and encrypted PEM parsing, PuTTY PPK parsing, server-key pin data, argument quoting, atomic marker replacement, session-bound cleanup confirmation, three-state access verification, expiry generation and handoff updates, dedicated-account expiry timer generation and removal, legacy-session loading, audit privacy, and the constrained same-EXE/system-OpenSSH process model.
 
 The disposable Ubuntu acceptance harness additionally tests:
 

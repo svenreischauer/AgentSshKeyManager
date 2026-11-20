@@ -515,7 +515,7 @@ namespace AgentSshKeyManager
             setup.Controls.Add(_hoursNumber);
             Label hoursLabel = MakeLabel("hours", 658, 52, 60);
             setup.Controls.Add(hoursLabel);
-            SetFieldHelp("Choose how many hours the access is planned to last. Automatic blocking requires the expiry option.",
+            SetFieldHelp("Choose how many hours the access lasts. The server enforces it only with automatic expiry.",
                 durationLabel, _hoursNumber, hoursLabel);
 
             _createButton = new Button();
@@ -534,9 +534,9 @@ namespace AgentSshKeyManager
             _expiryCheck.Location = new Point(500, 197);
             _expiryCheck.Size = new Size(238, 23);
             _expiryCheck.Checked = true;
-            _expiryCheck.Text = "OpenSSH expiry option (optional)";
+            _expiryCheck.Text = "Expire automatically on the server";
             setup.Controls.Add(_expiryCheck);
-            SetFieldHelp("Optional: Block new logins after the selected time. Open SSH connections stay active.",
+            SetFieldHelp("Recommended. At the end time the server blocks the key. For a dedicated account it also deletes the account and its sudo rule and closes open sessions (needs systemd). For an existing user, open sessions stay active.",
                 _expiryCheck);
 
             _dedicatedAdminCheck = new CheckBox();
@@ -703,6 +703,17 @@ namespace AgentSshKeyManager
             return "not checked";
         }
 
+        internal const string ExpiryFailureText =
+            "Automatic expiry could not be set up. The server may reject the OpenSSH expiry option or, for a dedicated account, may not run systemd.";
+
+        internal static string ExpiryConfirmationText(bool dedicatedAdmin)
+        {
+            return (dedicatedAdmin
+                ? "Automatic expiry: at the end time the server blocks the key, deletes the temporary account and its sudo rule, and closes its open SSH sessions (systemd timer)."
+                : "Automatic expiry: at the end time the server blocks new logins with the key. Open SSH sessions stay active and the key entry remains until you delete the access.") +
+                " If the server cannot do this, the tool can retry without automatic expiry.\n\n";
+        }
+
         private static string FormatLocalDate(DateTime utc)
         {
             if (utc == DateTime.MinValue) return "-";
@@ -812,7 +823,7 @@ namespace AgentSshKeyManager
                     ? "2. The tool creates a dedicated temporary account with unrestricted passwordless sudo. This grants full administrator access.\n\n"
                     : "2. The key is installed for the existing user. Root or unrestricted sudo also grants full administrator access.\n\n") +
                 (enforceServerExpiry
-                    ? "The optional OpenSSH expiry setting will be tested first. If the server rejects it, the tool can retry the same access without that option.\n\n"
+                    ? ExpiryConfirmationText(dedicatedAdmin)
                     : "The server will not expire this access automatically. You must remove it with this tool after the work is complete.\n\n") +
                 "Continue?",
                 "Create temporary access", MessageBoxButtons.OKCancel,
@@ -858,7 +869,7 @@ namespace AgentSshKeyManager
                 if (verification.Outcome != TemporaryAccessOutcome.Accepted && record.EnforceServerExpiry)
                 {
                     DialogResult retryWithoutExpiry = MessageBox.Show(this,
-                        "The new key could not log in with the OpenSSH expiry option. The server may not support this option. Retry without automatic expiry?\n\nThe separate password window will open again. You must then remove the access manually with this tool.",
+                        ExpiryFailureText + " Retry without automatic expiry?\n\nThe separate password window will open again. You must then remove the access manually with this tool.",
                         "Retry without expiry option", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                     if (retryWithoutExpiry == DialogResult.Yes)
                     {
@@ -884,7 +895,7 @@ namespace AgentSshKeyManager
                     RefreshList(record);
                     Log(record.LastMessage);
                     string expiryHint = record.EnforceServerExpiry
-                        ? "\n\nIf the server uses an incompatible OpenSSH configuration, create a new access without the server-side expiry option."
+                        ? "\n\nIf the server uses an incompatible OpenSSH configuration or has no systemd, create a new access without automatic expiry."
                         : "";
                     MessageBox.Show(this,
                         "Login with the temporary key failed. Clean up this entry with 'Remove access', then create a new one. " +
@@ -1566,7 +1577,10 @@ namespace AgentSshKeyManager
         public static void WriteAgentInstructions(SessionRecord record)
         {
             string validityText = record.EnforceServerExpiry
-                ? "The server-side access expires on " + record.ExpiresUtcValue.ToLocalTime().ToString("yyyy-MM-dd 'at' HH:mm") + ".\r\n"
+                ? "The server-side access expires on " + record.ExpiresUtcValue.ToLocalTime().ToString("yyyy-MM-dd 'at' HH:mm") +
+                  (record.UsesDedicatedAdminAccount
+                      ? ". The account is then deleted and open SSH sessions are closed.\r\n"
+                      : ".\r\n")
                 : "Planned end: " + record.ExpiresUtcValue.ToLocalTime().ToString("yyyy-MM-dd 'at' HH:mm") + ". Remove the access with this tool afterwards.\r\n";
             string text = AgentTaskInstruction + "\r\n\r\n" +
                 "Temporary SSH access for an agent\r\n\r\n" +
@@ -1907,6 +1921,7 @@ namespace AgentSshKeyManager
             string ownerValue = record.Marker + " user=" + record.User;
             string ownerHomeValue = "home=" + home;
             return "set -eu; " + BuildAuthorizedLineAssignment(authorizedLine, useExpiry, expiryUnixSeconds) +
+                   (useExpiry ? ExpiryTimerPrecheck : "") +
                    "u=" + ShellQuote(record.User) + "; h=" + ShellQuote(home) + "; rule=" + ShellQuote(sudoers) + "; owner=" + ShellQuote(owner) + "; " +
                    "owner_value=" + ShellQuote(ownerValue) + "; owner_home_value=" + ShellQuote(ownerHomeValue) + "; sudo -v; " +
                    "sudo install -d -m 700 -o root -g root /var/lib/agent-ssh-key-manager; " +
@@ -1931,6 +1946,9 @@ namespace AgentSshKeyManager
                    "trap 'sudo rm -f \"$tmp\"' EXIT HUP INT TERM; " +
                    "printf '%s\\n' " + ShellQuote(markerLine) + " " + ShellQuote(sudoRule) + " | sudo tee \"$tmp\" >/dev/null; " +
                    "sudo chmod 440 \"$tmp\"; sudo /usr/sbin/visudo -cf \"$tmp\" >/dev/null; sudo mv \"$tmp\" \"$rule\"; trap - EXIT HUP INT TERM; " +
+                   // The expiry timer is installed before the key so that a failed
+                   // timer setup can never leave a working key without cleanup.
+                   (useExpiry ? BuildExpiryTimerInstall(record, expiryUnixSeconds) : "") +
                    "printf '%s\\n' \"$authorized_line\" | sudo tee \"$h/.ssh/authorized_keys\" >/dev/null; " +
                    "sudo chown \"$u:$u\" \"$h/.ssh/authorized_keys\"; sudo chmod 600 \"$h/.ssh/authorized_keys\"";
         }
@@ -1993,7 +2011,120 @@ namespace AgentSshKeyManager
                    "if sudo test -e \"$h\"; then if [ \"$owned\" -ne 1 ]; then printf '%s\\n' 'Refusing to remove an unowned home directory.' >&2; exit 1; fi; " +
                    "sudo rm -rf -- \"$h\"; fi; " +
                    "sudo rm -f \"$rule\"; ! id -u \"$u\" >/dev/null 2>&1; sudo test ! -e \"$rule\"; sudo test ! -e \"$h\"; " +
+                   BuildExpiryTimerRemoval(record) +
                    "sudo rm -f \"$owner\"; sudo test ! -e \"$owner\"; printf '%s\\n' " + ShellQuote(confirmation);
+        }
+
+        private const string ExpiryStateDirectory = "/var/lib/agent-ssh-key-manager";
+        private const string SystemdUnitDirectory = "/etc/systemd/system";
+
+        // Runs before any change so that a server without systemd fails cleanly and
+        // the caller can offer the documented retry without automatic expiry.
+        private const string ExpiryTimerPrecheck =
+            "if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then " +
+            "printf '%s\\n' 'Automatic expiry needs systemd on the server.' >&2; exit 1; fi; ";
+
+        internal static string ExpiryUnitName(SessionRecord record)
+        {
+            if (record == null || !Regex.IsMatch(record.Id ?? "", "^[a-fA-F0-9]{32}$"))
+            {
+                throw new InvalidOperationException("The access session identifier is invalid.");
+            }
+            return "agent-ssh-expire-" + record.Id.ToLowerInvariant();
+        }
+
+        internal static string ExpiryScriptPath(SessionRecord record)
+        {
+            ExpiryUnitName(record); // validates the session identifier
+            return ExpiryStateDirectory + "/" + record.Id.ToLowerInvariant() + ".expire";
+        }
+
+        internal static string ExpiryOnCalendar(long expiryUnixSeconds)
+        {
+            DateTime epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            return epoch.AddSeconds(expiryUnixSeconds).ToString("yyyy'-'MM'-'dd HH':'mm':'ss", CultureInfo.InvariantCulture) + " UTC";
+        }
+
+        // Root-run script started by the systemd timer. It reuses the exact
+        // session-bound cleanup that "Delete access" runs, which also removes
+        // this script and its timer, and retries briefly in case processes of
+        // the temporary user are still exiting.
+        internal static string BuildExpiryCleanupScript(SessionRecord record, long expiryUnixSeconds)
+        {
+            if (expiryUnixSeconds <= 0)
+            {
+                throw new InvalidOperationException("The temporary key expiry date is invalid.");
+            }
+            string cleanup = RootSudoCompatibilityPrefix + BuildDedicatedCleanupCommand(record);
+            return "#!/bin/bash\n" +
+                   "# " + record.Marker + " automatic expiry cleanup (Agent SSH Key Manager)\n" +
+                   "set -u\n" +
+                   "expires=" + expiryUnixSeconds.ToString(CultureInfo.InvariantCulture) + "\n" +
+                   "if [ \"$(date +%s)\" -lt \"$expires\" ]; then exit 0; fi\n" +
+                   "cleanup=" + ShellQuote(cleanup) + "\n" +
+                   "attempt=1\n" +
+                   "while ! /bin/bash -c \"$cleanup\"; do\n" +
+                   "  if [ \"$attempt\" -ge 6 ]; then exit 1; fi\n" +
+                   "  attempt=$((attempt + 1)); sleep 10\n" +
+                   "done\n";
+        }
+
+        internal static string BuildExpiryServiceUnit(SessionRecord record)
+        {
+            return "[Unit]\n" +
+                   "Description=Agent SSH Key Manager: remove expired temporary access " + record.User + "\n\n" +
+                   "[Service]\n" +
+                   "Type=oneshot\n" +
+                   "ExecStart=/bin/bash " + ExpiryScriptPath(record) + "\n";
+        }
+
+        // OnCalendar fires at the end time; OnBootSec catches an end time that
+        // passed while the server was off (the script ignores early triggers).
+        internal static string BuildExpiryTimerUnit(SessionRecord record, long expiryUnixSeconds)
+        {
+            return "[Unit]\n" +
+                   "Description=Agent SSH Key Manager: expiry of temporary access " + record.User + "\n\n" +
+                   "[Timer]\n" +
+                   "OnCalendar=" + ExpiryOnCalendar(expiryUnixSeconds) + "\n" +
+                   "OnBootSec=1min\n" +
+                   "AccuracySec=1s\n" +
+                   "Persistent=true\n" +
+                   "Unit=" + ExpiryUnitName(record) + ".service\n\n" +
+                   "[Install]\n" +
+                   "WantedBy=timers.target\n";
+        }
+
+        private static string BuildExpiryTimerInstall(SessionRecord record, long expiryUnixSeconds)
+        {
+            string unit = ExpiryUnitName(record);
+            return "x_script=" + ShellQuote(ExpiryScriptPath(record)) + "; " +
+                   "x_service=" + ShellQuote(SystemdUnitDirectory + "/" + unit + ".service") + "; " +
+                   "x_timer=" + ShellQuote(SystemdUnitDirectory + "/" + unit + ".timer") + "; " +
+                   "x_unit=" + ShellQuote(unit + ".timer") + "; " +
+                   "printf '%s' " + ShellQuote(BuildExpiryCleanupScript(record, expiryUnixSeconds)) + " | sudo tee \"$x_script\" >/dev/null; " +
+                   "sudo chown root:root \"$x_script\"; sudo chmod 700 \"$x_script\"; " +
+                   "printf '%s' " + ShellQuote(BuildExpiryServiceUnit(record)) + " | sudo tee \"$x_service\" >/dev/null; sudo chmod 644 \"$x_service\"; " +
+                   "printf '%s' " + ShellQuote(BuildExpiryTimerUnit(record, expiryUnixSeconds)) + " | sudo tee \"$x_timer\" >/dev/null; sudo chmod 644 \"$x_timer\"; " +
+                   "sudo systemctl daemon-reload; " +
+                   "if ! sudo systemctl enable --now \"$x_unit\" >/dev/null 2>&1 || ! sudo systemctl is-active --quiet \"$x_unit\"; then " +
+                   "printf '%s\\n' 'The automatic expiry timer could not be started.' >&2; exit 1; fi; ";
+        }
+
+        // Idempotent: also runs for sessions created without a timer and from
+        // inside the timer's own service (it stops only the timer, not the service).
+        private static string BuildExpiryTimerRemoval(SessionRecord record)
+        {
+            string unit = ExpiryUnitName(record);
+            string script = ShellQuote(ExpiryScriptPath(record));
+            string service = ShellQuote(SystemdUnitDirectory + "/" + unit + ".service");
+            string timer = ShellQuote(SystemdUnitDirectory + "/" + unit + ".timer");
+            return "x_unit=" + ShellQuote(unit) + "; " +
+                   "if command -v systemctl >/dev/null 2>&1; then sudo systemctl disable --now \"$x_unit.timer\" >/dev/null 2>&1 || true; fi; " +
+                   "sudo rm -f " + timer + " " + service + " " + script + "; " +
+                   "if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then " +
+                   "sudo systemctl daemon-reload >/dev/null 2>&1 || true; " +
+                   "sudo systemctl reset-failed \"$x_unit.timer\" >/dev/null 2>&1 || true; fi; " +
+                   "sudo test ! -e " + timer + "; sudo test ! -e " + service + "; sudo test ! -e " + script + "; ";
         }
 
         private static string DedicatedHomePath(SessionRecord record)
@@ -2359,6 +2490,46 @@ namespace AgentSshKeyManager
                 Assert(dedicatedCleanup.IndexOf(cleanupConfirmation, StringComparison.Ordinal) >= 0 &&
                     dedicatedCleanup.IndexOf("test ! -e", StringComparison.Ordinal) >= 0,
                     "dedicated cleanup postcondition missing");
+
+                // Automatic expiry for dedicated accounts: a root systemd timer runs the
+                // same session-bound cleanup at the end time.
+                string expiryUnit = SshTools.ExpiryUnitName(record);
+                string dedicatedExpirySetup = SshTools.BuildDedicatedSetupCommand(record, "ssh-ed25519 AAAATEST " + record.Marker, true, 4102444799L);
+                string expiryScript = SshTools.BuildExpiryCleanupScript(record, 4102444799L);
+                string expiryTimer = SshTools.BuildExpiryTimerUnit(record, 4102444799L);
+                Assert(expiryUnit == "agent-ssh-expire-" + record.Id.ToLowerInvariant(), "expiry unit name is not session-bound");
+                Assert(SshTools.ExpiryOnCalendar(4102444799L) == "2099-12-31 23:59:59 UTC", "expiry calendar time is not the exact UTC end time");
+                Assert(expiryTimer.IndexOf("OnCalendar=2099-12-31 23:59:59 UTC", StringComparison.Ordinal) >= 0 &&
+                    expiryTimer.IndexOf("OnBootSec=", StringComparison.Ordinal) >= 0 &&
+                    expiryTimer.IndexOf("Unit=" + expiryUnit + ".service", StringComparison.Ordinal) >= 0 &&
+                    expiryTimer.IndexOf("WantedBy=timers.target", StringComparison.Ordinal) >= 0,
+                    "expiry timer unit incomplete");
+                Assert(expiryScript.IndexOf("expires=4102444799", StringComparison.Ordinal) >= 0 &&
+                    expiryScript.IndexOf("-lt \"$expires\" ]; then exit 0", StringComparison.Ordinal) >= 0,
+                    "expiry script does not ignore early triggers");
+                Assert(expiryScript.IndexOf(SshTools.ShellQuote(SshTools.RootSudoCompatibilityPrefix + dedicatedCleanup), StringComparison.Ordinal) >= 0,
+                    "expiry script does not run the exact dedicated cleanup");
+                Assert(dedicatedExpirySetup.IndexOf("expiry-time=", StringComparison.Ordinal) >= 0, "dedicated expiry key option missing");
+                Assert(dedicatedExpirySetup.IndexOf("/run/systemd/system", StringComparison.Ordinal) >= 0 &&
+                    dedicatedExpirySetup.IndexOf("/run/systemd/system", StringComparison.Ordinal) < dedicatedExpirySetup.IndexOf("useradd", StringComparison.Ordinal),
+                    "systemd precheck must run before any server change");
+                Assert(dedicatedExpirySetup.IndexOf("systemctl enable --now", StringComparison.Ordinal) >= 0 &&
+                    dedicatedExpirySetup.IndexOf("is-active --quiet", StringComparison.Ordinal) >= 0,
+                    "expiry timer activation is not verified");
+                Assert(dedicatedExpirySetup.IndexOf("is-active --quiet", StringComparison.Ordinal) <
+                    dedicatedExpirySetup.LastIndexOf("sudo tee \"$h/.ssh/authorized_keys\"", StringComparison.Ordinal),
+                    "key installed before the expiry timer was confirmed");
+                Assert(dedicatedSetup.IndexOf("systemctl", StringComparison.Ordinal) < 0 &&
+                    dedicatedSetup.IndexOf(expiryUnit, StringComparison.Ordinal) < 0,
+                    "setup without expiry must not install a timer");
+                Assert(dedicatedCleanup.IndexOf("disable --now", StringComparison.Ordinal) >= 0 &&
+                    dedicatedCleanup.IndexOf("/etc/systemd/system/" + expiryUnit + ".timer", StringComparison.Ordinal) >= 0 &&
+                    dedicatedCleanup.IndexOf("/etc/systemd/system/" + expiryUnit + ".service", StringComparison.Ordinal) >= 0 &&
+                    dedicatedCleanup.IndexOf(SshTools.ExpiryScriptPath(record), StringComparison.Ordinal) >= 0,
+                    "dedicated cleanup does not remove the expiry timer");
+                Assert(dedicatedCleanup.IndexOf("disable --now", StringComparison.Ordinal) > dedicatedCleanup.IndexOf("userdel", StringComparison.Ordinal),
+                    "expiry timer removed before the account was deleted");
+
                 Assert(SshTools.CleanupWasConfirmed(record, 0, "before\n" + cleanupConfirmation + "\nafter"),
                     "valid cleanup confirmation was rejected");
                 Assert(!SshTools.CleanupWasConfirmed(record, 1, cleanupConfirmation) &&
@@ -2563,6 +2734,7 @@ namespace AgentSshKeyManager
                 report.AppendLine("Install/remove marker logic: OK");
                 report.AppendLine("Definitive cleanup and three-state access verification: OK");
                 report.AppendLine("Optional expiry command generation: OK");
+                report.AppendLine("Dedicated-account expiry timer generation and removal: OK");
                 report.AppendLine("Direct remote command transport: OK");
                 report.AppendLine("Windows argument round-trip: OK");
                 report.AppendLine("Constrained manager/OpenSSH launch and exit propagation: OK");

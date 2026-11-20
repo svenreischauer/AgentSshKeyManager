@@ -156,7 +156,11 @@ namespace AgentSshKeyManager
                     : "The manager will show a public key and a session-specific command for you to run through a trusted console or existing SSH session.";
                 SetBusy(false, "");
                 DialogResult confirmation = MessageBox.Show(this,
-                    BuildHostKeyReviewText(host, port, hostKey) + "\n\n" + modeWarning + "\n\n" + bootstrapNote + "\n\nContinue?",
+                    BuildHostKeyReviewText(host, port, hostKey) + "\n\n" + modeWarning + "\n\n" + bootstrapNote + "\n\n" +
+                    (enforceServerExpiry
+                        ? ExpiryConfirmationText(dedicatedAdmin)
+                        : "The server will not expire this access automatically. You must delete it with this tool after the work is complete.\n\n") +
+                    "Continue?",
                     "Create temporary access", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
                 if (confirmation != DialogResult.OK) return;
                 SetBusy(true, "Preparing access ...");
@@ -229,7 +233,7 @@ namespace AgentSshKeyManager
                     if (!installation.Success && record.EnforceServerExpiry && installation.RollbackSucceeded)
                     {
                         DialogResult retry = MessageBox.Show(this,
-                            "The installation with the optional OpenSSH expiry restriction failed and its changes were rolled back. Retry the same access without server-side expiry?\n\nThe planned end time remains visible, but you must delete the access manually afterwards.",
+                            ExpiryFailureText + " The changes were rolled back. Retry the same access without automatic expiry?\n\nThe planned end time remains visible, but you must delete the access manually afterwards.",
                             "Retry without server-side expiry", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                         if (retry == DialogResult.Yes)
                         {
@@ -261,7 +265,7 @@ namespace AgentSshKeyManager
                 if (verification.Outcome != TemporaryAccessOutcome.Accepted && record.EnforceServerExpiry)
                 {
                     DialogResult retry = MessageBox.Show(this,
-                        "The new key could not log in with the OpenSSH expiry option. The server may not support this option. Retry without automatic expiry?\n\nThe planned end time remains visible, but you must delete the access manually afterwards.",
+                        ExpiryFailureText + " Retry without automatic expiry?\n\nThe planned end time remains visible, but you must delete the access manually afterwards.",
                         "Retry without server-side expiry", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                     if (retry == DialogResult.Yes)
                     {
